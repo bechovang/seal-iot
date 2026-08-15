@@ -22,6 +22,8 @@ class GuardedActionPipeline:
         history=None,
         incident_store: IncidentStore | None = None,
         model: PlantModel | None = None,
+        runbook_store=None,
+        metric_store=None,
     ) -> None:
         from act import ActExecutor
         from decide import Decider
@@ -35,14 +37,48 @@ class GuardedActionPipeline:
         self.incident_store = incident_store or IncidentStore(harness.incident.db_path,
                                                               harness.incident.retry_max,
                                                               harness.incident.ttl_seconds_event)
-        self.fsm = IncidentFSM(self.incident_store, harness.incident.retry_max)
+        self.metric_store = metric_store
+        self.runbook_store = runbook_store
+        self._last_outcome = ""
+        self.fsm = IncidentFSM(self.incident_store, harness.incident.retry_max,
+                               distill_hook=self._distill)
         from history import HistoryBuffer
         self.history = history or HistoryBuffer(":memory:")
         self.verify = OutcomeClassifier(self.history, harness.verify)
 
+    def _distill(self, incident) -> None:
+        """AD-3: distil resolved incidents into the runbook wiki; AD-11: record the
+        per-incident metric row. Both fire inside the resolve transaction."""
+        if self.runbook_store is not None and self._diag is not None:
+            self.runbook_store.record_resolution(
+                self._diag.symptom_tokens or ["recur_symptom"],
+                self._diag.root_cause or "unknown",
+                self._diag.action_hint or "recalibrate",
+            )
+        if self.metric_store is not None:
+            from learn import MetricRow
+
+            self.metric_store.record(MetricRow(
+                incident_id=incident.incident_id,
+                episode_key=self._diag.episode_key if self._diag else incident.episode_key,
+                detection_delay_sec=self._detect_delay,
+                rca_latency_sec=self._rca_latency,
+                resolution_time_sec=self._resolution_time,
+                outcome=self._last_outcome or "improved",
+                arm=self._arm,
+                signal_id=self._diag.signal_id if self._diag else "",
+            ))
+
     def run(self, diagnosis: Diagnosis, baseline: float = 0.0,
-            after_epoch_ms: int | None = None) -> dict:
+            after_epoch_ms: int | None = None,
+            detection_delay_sec: float = 0.0, rca_latency_sec: float = 0.0,
+            resolution_time_sec: float = 0.0, arm: str = "") -> dict:
         """Full guarded-act loop for one diagnosis; returns the incident state + outcome."""
+        self._diag = diagnosis
+        self._detect_delay = detection_delay_sec
+        self._rca_latency = rca_latency_sec
+        self._resolution_time = resolution_time_sec
+        self._arm = arm
         incident_id = self.fsm.create(diagnosis.episode_key)
         self.fsm.transition(incident_id, "diagnose")
 
@@ -70,6 +106,7 @@ class GuardedActionPipeline:
         outcome = self.verify.classify(diagnosis.signal_id, baseline,
                                        after_epoch_ms=after_epoch_ms,
                                        expected_effect=winner.get("predicted"))
+        self._last_outcome = outcome.classification
         inc = self.fsm.verify_outcome(incident_id, outcome.classification)
         return {
             "incident_id": incident_id,

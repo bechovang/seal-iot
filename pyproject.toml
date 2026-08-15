@@ -26,9 +26,11 @@ packages = [
     "history",
     "incident",
     "knowledge",
+    "learn",
     "llm",
     "perceive",
     "plant_model",
+    "score",
     "verify",
 ]
 

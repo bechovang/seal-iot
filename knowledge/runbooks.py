@@ -94,6 +94,27 @@ class RunbookStore:
         self.save(rb)
         return rb
 
+    def record_resolution(self, tokens: list[str], root_cause: str, action: str) -> Runbook:
+        """Knowledge distillation on incident resolve (AD-3). If a runbook already
+        matches this root cause (or overlaps heavily), increment occurrences and bump
+        reliability; otherwise create a fresh entry. Called inside the incident
+        resolve transaction, so it cannot race a concurrent runbook read."""
+        tokens = list(set(tokens))
+        existing = next((rb for rb in self._entries.values()
+                         if rb.root_cause == root_cause), None)
+        if existing is not None:
+            existing.occurrences += 1
+            # reliability rises with evidence, saturating (additive smoothing)
+            existing.reliability = round(min(0.99, existing.occurrences / (existing.occurrences + 1)), 4)
+            existing.symptom_tokens = sorted(set(existing.symptom_tokens) | set(tokens))
+            self.save(existing)
+            return existing
+        rb = Runbook(rid=f"rb-{len(self._entries) + 1:04d}",
+                     symptom_tokens=tokens, root_cause=root_cause, action=action,
+                     occurrences=1, reliability=1.0)
+        self.save(rb)
+        return rb
+
     def all(self) -> list[Runbook]:
         return list(self._entries.values())
 

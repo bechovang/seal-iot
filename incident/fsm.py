@@ -139,9 +139,11 @@ class IncidentFSM:
     """State machine with a single transition table. The sole behavior gate around
     the store (minting, transitions, retries, TTL escalation)."""
 
-    def __init__(self, store: IncidentStore, retry_max: int | None = None) -> None:
+    def __init__(self, store: IncidentStore, retry_max: int | None = None,
+                 distill_hook=None) -> None:
         self.store = store
         self.retry_max = retry_max if retry_max is not None else store.retry_max
+        self.distill_hook = distill_hook  # called on RESOLVED inside the transaction
 
     def create(self, episode_key: str, ts: str = "") -> str:
         created = _event_seconds(ts)
@@ -167,9 +169,14 @@ class IncidentFSM:
         return inc is not None and inc.retries < self.retry_max
 
     def verify_outcome(self, incident_id: str, outcome: str, ts: str = "") -> Incident:
-        """AD-9: only 'improved' resolves; no_change/worsened retry (bounded) or escalate."""
+        """AD-9: only 'improved' resolves; no_change/worsened retry (bounded) or escalate.
+        On resolve, fires the distill hook inside the same transaction (AD-3) so a
+        concurrent runbook read can never race a new write."""
         if outcome == "improved":
             inc = self.transition(incident_id, "resolve", ts)
+            if self.distill_hook and inc is not None:
+                self.distill_hook(inc)
+            return inc
         else:
             inc = self.store.get(incident_id)
             if inc is not None and inc.retries < self.retry_max:
