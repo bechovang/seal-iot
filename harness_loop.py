@@ -16,7 +16,20 @@ Top-level, adversary-free narrative for a recorded run:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+
+def _force_utf8_streams() -> None:
+    """Run on Windows consoles with cp936/cp1252 codepage where printing non-ASCII
+    (e.g. Vietnamese) raises UnicodeEncodeError. Reconfigure stdout/stderr to UTF-8
+    so the loop works without needing PYTHONUTF8=1 in the calling shell."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 
 from bus import InMemoryBus
 from bus.recorder import JsonlRecorder, replay, topics_in
@@ -169,4 +182,5 @@ def json_dumps(obj) -> str:
 
 
 if __name__ == "__main__":
+    _force_utf8_streams()
     raise SystemExit(main())
