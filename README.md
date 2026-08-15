@@ -68,7 +68,7 @@ Yêu cầu: **Python 3.12**, **uv**, và (tùy chọn) **Mosquitto** cho môi tr
 uv sync                      # cài dependencies (3.12.12)
 
 PYTHONUTF8=1 make lint       # kiểm tra cú pháp (bắt buộc trên Windows)
-PYTHONUTF8=1 make test       # chạy toàn bộ 49 bài kiểm tra
+PYTHONUTF8=1 make test       # chạy toàn bộ 54 bài kiểm tra (49 logic + 5 dữ liệu HAI thật)
 PYTHONUTF8=1 make e2e        # ghi + replay một sự cố mẫu qua JSONL rồi smoke-assert
 ```
 
@@ -104,4 +104,5 @@ PYTHONUTF8=1 uv run python harness_loop.py --log demo/e2e.jsonl --serve-ui 8799 
 | 4 | Tự học & đánh giá | ✅ |
 | 5 | Demo, khả năng phục hồi & trình bày | ✅ |
 
-Toàn bộ repo có 49 bài kiểm tra (`PYTHONUTF8=1 make check`), một dòng thời gian sự kiện duy nhất, không dùng wall-clock trong pipeline.
+Toàn bộ repo có **54 bài kiểm tra** (`PYTHONUTF8=1 make check`): 49 bài kiểm tra logic/an toàn + **5 bài test trên dữ liệu HAI 21.03 thật**
+(chạy trên `tai lieu/bo-du-lieu/03-HAI/`, tự bỏ qua nếu thiếu file). Một dòng thời gian sự kiện duy nhất, không dùng wall-clock trong pipeline.

@@ -83,9 +83,15 @@ seal iot/
 ## 3. Cơ chế vận hành theo từng stage
 
 ### 3.1. Ingest / hấp thụ dữ liệu
-- `adapters/hai.py` đọc bộ dữ liệu HAI, maps cột gốc (`P1_FC101`) → `signal_id` chuẩn
-  (`P1_FC_01`) theo `mapping.yaml` (đơn vị, scaling, vùng `area`, cặp setpoint/feedback).
-- Các cột `label_columns` bị **quarantine** — không publish.
+- `adapters/hai.py` đọc bộ dữ liệu HAI **thật** (hỗ trợ `.csv` và `.csv.gz`), maps cột gốc
+  (vd `P1_FT01`, cặp setpoint/feedback `P1_FCV01D`/`P1_FCV01Z`) → `signal_id` chuẩn
+  (`P1_FC_01`, `P1_FC_01_D`, `P1_FC_01_Z`) theo `mapping.yaml` (đơn vị, scaling, vùng `area`, cặp D/Z).
+- Cột `time` của HAI (`'2020-07-07 15:00:00'`, space-separated) được parse thành **event-time**
+  (epoch ms, coi là UTC) ngay tại ingest — nguồn dữ liệu thời lượng đường ống (AD-10).
+- Các cột `label_columns` (`attack`, `attack_P1|P2|P3`) bị **quarantine** — không publish.
+- Khi không cấp slice dữ liệu, adapter tự stream `synthetic_rows()` (seeded) để pipeline
+  chạy/test mà không cần file HAI thật (`adapters/hai.py::synthetic_rows`; `tests/test_epic6`
+  tự bỏ qua nếu thiếu file trên đĩa).
 - Telemetry được ghi vào `history/` (chỉ ingest được ghi) và publish lên `tele/<signal_id>`.
 - event-rate mặc định 1.0 Hz; tốc độ load cold-start là tiêu chí theo dõi (< 60 min).
 
@@ -229,3 +235,10 @@ NONE -> DETECTED -> DIAGNOSING -> PLANNING -> ACTING -> VERIFYING -> RESOLVED
 
 Make targets: `make lint`, `make test`, `make e2e` (ghi+replay+smoke), `make demo`
 (cùng vòng lặp dưới nhãn `red-team`), `make check` (lint+test+e2e).
+
+## 8. Xác nhận với dữ liệu HAI thật
+- `tests/test_epic6_real_hai.py` đọc **đúng file HAI 21.03** (`tai lieu/bo-du-lieu/03-HAI/`,
+  gzip) và kiểm: mọi `source` của `mapping.yaml` tồn tại trong file; cột `time` parse thành
+  event-time đơn điệu; ingest 2600 dòng thật → telemetry + history; **phát hiện được vùng
+  tấn công thật** (for inside test1 mở đầu ở dòng ~2111). Nếu file không tồn tại trên máy,
+  5 bài này **tự bỏ qua** (không chặn `make test`).

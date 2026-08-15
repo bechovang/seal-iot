@@ -48,12 +48,12 @@ pandas, PyYAML, pytest.)
 
 ```bash
 PYTHONUTF8=1 make lint      # kiểm tra cú pháp toàn bộ module
-PYTHONUTF8=1 make test      # chạy 49 bài kiểm tra
+PYTHONUTF8=1 make test      # chạy 54 bài kiểm tra
 PYTHONUTF8=1 make e2e       # ghi + replay một vòng sự cố qua JSONL rồi smoke-assert
 PYTHONUTF8=1 make check     # lint + test + e2e (kiểm tra tổng hợp)
 ```
 
-Khi `make test` in ra `49 passed in ...` là môi trường đã sẵn sàng.
+Khi `make test` in ra `54 passed in ...` là môi trường đã sẵn sàng.
 
 ---
 
@@ -120,8 +120,10 @@ PYTHONUTF8=1 uv run python harness_loop.py --log demo/e2e.jsonl --serve-ui 8799 
 Hai file YAML dẫn đường mọi hành vi:
 
 ### 6.1. `mapping.yaml` — mô hình nhà máy (tín hiệu chuẩn)
-- **`columns`**: map cột HAI gốc → `signal_id` chuẩn (đơn vị, loại `kind`:
-  `flow`/`pressure`/`temperature`/`setpoint`/`feedback`, vùng `area`).
+- **`columns`**: map cột HAI **thật** → `signal_id` chuẩn (đơn vị, loại `kind`:
+  `flow`/`pressure`/`setpoint`/`feedback`, vùng `area`). Đã căn chính theo file
+  `hai-21.03_test1.csv.gz` thật: flow `P1_FT01` + cặp `P1_FCV01D`/`P1_FCV01Z`;
+  áp lực `P1_PIT01` + cặp `P1_PCV01D`/`P1_PCV01Z`.
 - **`pairing`**: cặp `<signal, setpoint(D), feedback(Z)>` — nguồn bằng chứng **phân kỳ D/Z**.
 - **`commands`**: registry actuator (AD-8) — `target` (tín hiệu bị điều khiển),
   phạm vi vật lý `[min,max]`, **ranh an toàn `[safe_min,safe_max]`** dùng CHUNG cho
@@ -194,7 +196,7 @@ config.py, harness.yaml, mapping.yaml
 adapters/ bus/ perceive/ history/ diagnose/ knowledge/ llm/
 decide/ plant_model/ act/ incident/ verify/ learn/ score/ ui/
 harness_loop.py            # vòng demo record/replay
-tests/                     # 49 bài kiểm tra (Epic 1-5)
+tests/                     # 54 bài kiểm tra (Epic 1-5 + 5 bài trên dữ liệu HAI thật)
 ```
 
 ---
