@@ -3,45 +3,40 @@ rate_hz: 1.0
 broker:
   host: localhost
   port: 1883
-# Canonical signal model. `source` is the HAI column name; `signal_id` is the
-# canonical area_kind_nn name the pipeline uses. Label columns are quarantined.
+# Canonical signal model. `source` is the REAL HAI 21.03 column name (verified against
+# hai-21.03_test1.csv.gz / train1.csv.gz: 84 cols, header `time,P1_B*,P1_FCV*D/Z,...`);
+# `signal_id` is the canonical area_kind_nn name the pipeline uses. Label columns
+# (attack, attack_P1, attack_P2, attack_P3) are quarantined and never published.
 columns:
-  - {signal_id: P1_FC_01, source: P1_FC101, unit: 'm3/h', kind: flow, area: P1}
-  - {signal_id: P1_P_01, source: P1_P101, unit: 'kPa', kind: pressure, area: P1}
-  - {signal_id: P1_FC_01_D, source: P1_FC101_D, unit: 'm3/h', kind: setpoint, area: P1}
-  - {signal_id: P1_FC_01_Z, source: P1_FC101_Z, unit: 'm3/h', kind: feedback, area: P1}
-  - {signal_id: P2_FC_08, source: P2_FC801, unit: 'm3/h', kind: flow, area: P2}
-  - {signal_id: P2_P_08, source: P2_P801, unit: 'kPa', kind: pressure, area: P2}
-  - {signal_id: P2_FC_08_D, source: P2_FC801_D, unit: 'm3/h', kind: setpoint, area: P2}
-  - {signal_id: P2_FC_08_Z, source: P2_FC801_Z, unit: 'm3/h', kind: feedback, area: P2}
+  # P1 flow loop: flow transmitter + FCV setpoint(D) / feedback(Z)
+  - {signal_id: P1_FC_01,   source: P1_FT01,  unit: 'm3/h', kind: flow,    area: P1}
+  - {signal_id: P1_FC_01_D, source: P1_FCV01D, unit: 'm3/h', kind: setpoint, area: P1}
+  - {signal_id: P1_FC_01_Z, source: P1_FCV01Z, unit: 'm3/h', kind: feedback, area: P1}
+  # P1 pressure loop: pressure transmitter + PCV setpoint(D) / feedback(Z)
+  - {signal_id: P1_P_01,    source: P1_PIT01, unit: 'kPa', kind: pressure, area: P1}
+  - {signal_id: P1_P_01_D,  source: P1_PCV01D, unit: 'kPa', kind: setpoint, area: P1}
+  - {signal_id: P1_P_01_Z,  source: P1_PCV01Z, unit: 'kPa', kind: feedback, area: P1}
 # Setpoint / feedback pairing: first-class evidence for D/Z divergence (AD-5).
 pairing:
   - {signal: P1_FC_01, setpoint: P1_FC_01_D, feedback: P1_FC_01_Z}
-  - {signal: P2_FC_08, setpoint: P2_FC_08_D, feedback: P2_FC_08_Z}
+  - {signal: P1_P_01,  setpoint: P1_P_01_D,  feedback: P1_P_01_Z}
 # Actuator command registry (AD-8): safe envelope consumed by the shield AND the
-# plant model. Absolute engineering units. target = controlled signal; command_signal
-# = the actuator command the executor writes.
+# plant model. Absolute engineering units. target = controlled signal; the executor
+# writes the actuator command on cmd/<name>.
 commands:
   - {name: fc_controller, target: P1_FC_01_Z, min: 0.0, max: 50.0, safe_min: 1.0, safe_max: 40.0, default: 10.0, unit: 'm3/h', energy_cost: 0.5, risk_baseline: 0.2, effect_gain: 0.9}
-  - {name: fc_controller_p2, target: P2_FC_08_Z, min: 0.0, max: 50.0, safe_min: 1.0, safe_max: 40.0, default: 8.0, unit: 'm3/h', energy_cost: 0.5, risk_baseline: 0.2, effect_gain: 0.9}
+  - {name: pressure_controller, target: P1_P_01_Z, min: 0.0, max: 200.0, safe_min: 10.0, safe_max: 180.0, default: 100.0, unit: 'kPa', energy_cost: 0.3, risk_baseline: 0.15, effect_gain: 0.8}
 # Asset topology (AD-5): the RCA agent reasons over these connections, mapping each
 # asset to its governing signals. Heuristic, not certified.
 topology:
   assets:
-    P1_FC101: {area: P1, kind: flow_controller, signals: [P1_FC_01, P1_FC_01_D, P1_FC_01_Z]}
-    P2_FC801: {area: P2, kind: flow_controller, signals: [P2_FC_08, P2_FC_08_D, P2_FC_08_Z]}
+    P1_FLOW_AREA: {area: P1, kind: flow_controller, signals: [P1_FC_01, P1_FC_01_D, P1_FC_01_Z]}
+    P1_PRESSURE_AREA: {area: P1, kind: pressure_controller, signals: [P1_P_01, P1_P_01_D, P1_P_01_Z]}
   connections:
-    - {source: P1_FC101, target: P1_HEAT01}
-    - {source: P2_FC801, target: P2_REAC01}
+    - {source: P1_FLOW_AREA, target: P1_PRESSURE_AREA}
 # Ground-truth labels. Readable ONLY by score/ (deferred); never by pipeline stages.
 label_columns:
-  - P1_normal
-  - P1_attack1
-  - P1_attack2
-  - P1_attack3
-  - P1_attack4
-  - P1_attack5
-  - P1_attack6
-  - P1_attack7
-  - P2_normal
-  - P2_attack1
+  - attack
+  - attack_P1
+  - attack_P2
+  - attack_P3
