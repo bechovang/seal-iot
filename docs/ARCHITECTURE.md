@@ -229,7 +229,11 @@ NONE -> DETECTED -> DIAGNOSING -> PLANNING -> ACTING -> VERIFYING -> RESOLVED
   tối thiểu (có perceive, diagnose, **có command đã thực thi**, có result RESOLVED).
   Replay ghi ra **file `.replay` riêng** để không mọc-vô-hạn khi append trong lúc đọc.
 - `--serve-ui PORT`: mở dashboard **subscribe-only** (chỉ stdlib, không build step,
-  dashboard chết thì vòng lặp vẫn chạy).
+  dashboard chết thì vòng lặp vẫn chạy). Hiển thị: dải pipeline trực quan
+  (PERCEIVE→DIAGNOSE→DECIDE→ACT→VERIFY→INCIDENT + số đếm), **card từng sự cố**
+  (diễn tiến các stage, trạng thái FSM như RESOLVED, độ trễ theo **event-time** giữa
+  các stage dạng thanh), và trail sự kiện gần nhất. Endpoint `/?json=1` trả snapshot
+  JSON thô để tích hợp.
 - `--tts`: bật announcer tiếng Việt (queued + dedupe; nếu thiếu clip/synthesizer
   thì *im lặng*, không làm hỏng vòng lặp — AD-13).
 
