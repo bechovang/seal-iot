@@ -80,6 +80,20 @@ class HistoryBuffer:
         cur = self._conn.execute("SELECT COUNT(*) FROM telemetry")
         return int(cur.fetchone()[0])
 
+    def window_series(self, signal_ids: list[str], limit: int = 500) -> dict[str, list[tuple[int, float]]]:
+        """Chronological (ts_epoch_ms, value) series per requested signal for the
+        most-recent `limit` samples. Used by DIAGNOSE causal-graph weighting (AD-5)."""
+        marks = ",".join("?" * len(signal_ids))
+        cur = self._conn.execute(
+            f"SELECT signal_id, ts_epoch_ms, value FROM telemetry "
+            f"WHERE signal_id IN ({marks}) ORDER BY ts_epoch_ms ASC LIMIT ?",
+            (*signal_ids, limit),
+        )
+        out: dict[str, list[tuple[int, float]]] = {s: [] for s in signal_ids}
+        for sid, ts, val in cur.fetchall():
+            out[sid].append((int(ts), float(val)))
+        return out
+
     def close(self) -> None:
         with _LOCK:
             self._conn.close()

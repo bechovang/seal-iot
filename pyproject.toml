@@ -1,7 +1,7 @@
 [project]
 name = "seal-iot"
-version = "0.1.0"
-description = "SEAL IoT Smart Ops Harness - Epic 1 foundation (transport, ingestion, perception)"
+version = "0.2.0"
+description = "SEAL IoT Smart Ops Harness - Epics 1-2 (foundation, perception, diagnosis & runbook memory)"
 requires-python = ">=3.11.9,<3.13"
 dependencies = [
     "paho-mqtt>=2.1.0",
@@ -9,6 +9,9 @@ dependencies = [
     "numpy>=1.26",
     "PyYAML>=6.0",
     "scikit-learn>=1.4",
+    "networkx>=3.6.1",
+    "statsmodels>=0.14.6",
+    "pandas>=2.0",
     "pytest>=8.0",
 ]
 
@@ -17,7 +20,10 @@ py-modules = ["config"]
 packages = [
     "adapters",
     "bus",
+    "diagnose",
     "history",
+    "knowledge",
+    "llm",
     "perceive",
 ]
 

@@ -4,7 +4,7 @@ install:
 	uv sync
 
 lint:
-	uv run python -m compileall -q config.py adapters bus history perceive
+	uv run python -m compileall -q config.py adapters bus history perceive diagnose knowledge llm
 	@echo "lint ok"
 
 test:

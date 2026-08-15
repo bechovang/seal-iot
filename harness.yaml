@@ -1,8 +1,45 @@
-# Runtime knobs for the harness. Objective weights/shield rules belong to
-# Epics 2-3 (deferred); this epic consumes event rate + detection params.
+# Runtime knobs for the harness. Objective weights/shield rules belong to Epics 3;
+# this epic adds symptom taxonomy + diagnosis + LLM/debate knobs.
 event_rate_hz: 1.0
 anomaly_gain: 1.0
 ema:
   span: 20.0
 adwin:
   delta: 0.002
+
+# Closed symptom-token taxonomy (AD-3). Free-form symptom strings are never stored
+# or matched; LLM prose maps onto these tokens at distill time. Owned by knowledge/.
+symptom_taxonomy:
+  - setpoint_divergence
+  - feedback_offset
+  - temp_spike
+  - pressure_drop
+  - flow_dip
+  - no_current_change
+  - noise_burst
+  - deadband
+  - valve_stuck
+  - pump_surge
+
+runbook:
+  jaccard_threshold: 0.6
+  min_tokens_match: 2
+  store_path: knowledge/runbooks
+
+diagnosis:
+  causal_lags: [1, 2, 3]
+  correlation_min: 0.6
+  granger_enabled: true
+  granger_maxlag: 2
+  granger_pvalue: 0.05
+  max_hypotheses: 3
+
+llm:
+  provider: openrouter
+  default_model: anthropic/claude-sonnet-4-20250514
+  budget_per_call_path: 3
+  fallback: single_pass
+
+debate:
+  role_order: [proposer, critic, arbiter]
+  max_turns: 1

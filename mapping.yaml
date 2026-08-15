@@ -18,6 +18,15 @@ columns:
 pairing:
   - {signal: P1_FC_01, setpoint: P1_FC_01_D, feedback: P1_FC_01_Z}
   - {signal: P2_FC_08, setpoint: P2_FC_08_D, feedback: P2_FC_08_Z}
+# Asset topology (AD-5): the RCA agent reasons over these connections, mapping each
+# asset to its governing signals. Heuristic, not certified.
+topology:
+  assets:
+    P1_FC101: {area: P1, kind: flow_controller, signals: [P1_FC_01, P1_FC_01_D, P1_FC_01_Z]}
+    P2_FC801: {area: P2, kind: flow_controller, signals: [P2_FC_08, P2_FC_08_D, P2_FC_08_Z]}
+  connections:
+    - {source: P1_FC101, target: P1_HEAT01}
+    - {source: P2_FC801, target: P2_REAC01}
 # Ground-truth labels. Readable ONLY by score/ (deferred); never by pipeline stages.
 label_columns:
   - P1_normal
