@@ -59,19 +59,64 @@ class Topology:
 
 
 @dataclass
+class Command:
+    name: str
+    target: str
+    min: float
+    max: float
+    safe_min: float
+    safe_max: float
+    default: float
+    unit: str = ""
+    energy_cost: float = 0.5
+    risk_baseline: float = 0.2
+    effect_gain: float = 0.9
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Command":
+        return cls(
+            name=d["name"],
+            target=d["target"],
+            min=float(d.get("min", 0.0)),
+            max=float(d.get("max", 100.0)),
+            safe_min=float(d.get("safe_min", 0.0)),
+            safe_max=float(d.get("safe_max", 100.0)),
+            default=float(d.get("default", 0.0)),
+            unit=d.get("unit", ""),
+            energy_cost=float(d.get("energy_cost", 0.5)),
+            risk_baseline=float(d.get("risk_baseline", 0.2)),
+            effect_gain=float(d.get("effect_gain", 0.9)),
+        )
+
+
+@dataclass
 class Mapping:
-    dataset: str
-    rate_hz: float
-    columns: list[MappedSignal] = field(default_factory=list)
-    pairing: list[Pairing] = field(default_factory=list)
-    label_columns: list[str] = field(default_factory=list)
-    broker_host: str = "localhost"
-    broker_port: int = 1883
-    topology: Topology = field(default_factory=Topology)
+    def __init__(
+        self,
+        dataset: str,
+        rate_hz: float,
+        columns: list[MappedSignal],
+        pairing: list[Pairing] | None = None,
+        label_columns: list[str] | None = None,
+        broker_host: str = "localhost",
+        broker_port: int = 1883,
+        topology: Topology | None = None,
+        commands: list[Command] | None = None,
+    ) -> None:
+        self.dataset = dataset
+        self.rate_hz = rate_hz
+        self.columns = columns
+        self.pairing = pairing or []
+        self.label_columns = label_columns or []
+        self.broker_host = broker_host
+        self.broker_port = broker_port
+        self.topology = topology or Topology()
+        self.commands = commands or []
+        self._by_id = {c.signal_id: c for c in columns}
 
     @property
     def by_id(self) -> dict[str, MappedSignal]:
-        return {c.signal_id: c for c in self.columns}
+        return self._by_id
 
     def pair_for(self, signal_id: str) -> Pairing | None:
         for p in self.pairing:
@@ -83,6 +128,12 @@ class Mapping:
         for name, meta in self.topology.assets.items():
             if signal_id in meta.get("signals", []):
                 return name
+        return None
+
+    def command_for(self, target_signal: str) -> Command | None:
+        for c in self.commands:
+            if c.target == target_signal:
+                return c
         return None
 
     def validate(self) -> list[str]:
@@ -97,6 +148,14 @@ class Mapping:
                     errors.append(f"pairing references unknown signal {ref!r}")
         if self.rate_hz <= 0:
             errors.append("rate_hz must be > 0")
+        names = [c.name for c in self.commands]
+        if len(names) != len(set(names)):
+            errors.append("duplicate command name")
+        for c in self.commands:
+            if c.safe_min > c.safe_max:
+                errors.append(f"command {c.name}: safe_min > safe_max")
+            if c.safe_min < c.min or c.safe_max > c.max:
+                errors.append(f"command {c.name}: safe envelope outside physical range")
         return errors
 
 
@@ -113,6 +172,7 @@ def load_mapping(path: Path | None = None) -> Mapping:
         broker_host=cfg.get("broker", {}).get("host", "localhost"),
         broker_port=int(cfg.get("broker", {}).get("port", 1883)),
         topology=_parse_topology(cfg.get("topology", {})),
+        commands=[Command.from_dict(c) for c in cfg.get("commands", [])],
     )
     errs = m.validate()
     if errs:
@@ -159,6 +219,26 @@ class DebateConfig:
 
 
 @dataclass
+class DecideConfig:
+    weights: dict = field(default_factory=lambda: {"alpha": 0.5, "beta": 0.15, "gamma": 0.2, "delta": 0.15})
+    candidate_count: int = 2
+
+
+@dataclass
+class VerifyConfig:
+    window_samples: int = 20
+    improved_threshold: float = 0.3
+    worsened_threshold: float = 0.1
+
+
+@dataclass
+class IncidentConfig:
+    retry_max: int = 3
+    ttl_seconds_event: float = 3600.0
+    db_path: str = "incident/incidents.db"
+
+
+@dataclass
 class HarnessConfig:
     event_rate_hz: float = 1.0
     adwin_delta: float = 0.002
@@ -169,6 +249,9 @@ class HarnessConfig:
     diagnosis: DiagnosisConfig = field(default_factory=DiagnosisConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     debate: DebateConfig = field(default_factory=DebateConfig)
+    decide: DecideConfig = field(default_factory=DecideConfig)
+    verify: VerifyConfig = field(default_factory=VerifyConfig)
+    incident: IncidentConfig = field(default_factory=IncidentConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "HarnessConfig":
@@ -183,6 +266,9 @@ class HarnessConfig:
             diagnosis=_as(DiagnosisConfig, cfg.get("diagnosis", {})),
             llm=_as(LLMConfig, cfg.get("llm", {})),
             debate=_as(DebateConfig, cfg.get("debate", {})),
+            decide=_as(DecideConfig, cfg.get("decide", {})),
+            verify=_as(VerifyConfig, cfg.get("verify", {})),
+            incident=_as(IncidentConfig, cfg.get("incident", {})),
         )
 
 

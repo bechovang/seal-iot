@@ -4,7 +4,7 @@ install:
 	uv sync
 
 lint:
-	uv run python -m compileall -q config.py adapters bus history perceive diagnose knowledge llm
+	uv run python -m compileall -q config.py adapters act bus decide diagnose history incident knowledge llm perceive plant_model verify
 	@echo "lint ok"
 
 test:

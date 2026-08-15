@@ -21,6 +21,12 @@ def stage_topic(stage: str) -> str:
     return f"{STAGE_TOPIC_PREFIX}{stage}"
 
 
+def command_topic(command_name: str) -> str:
+    """Canonical actuator command topic: ``cmd/<command_name>`` (AD-7). Published ONLY
+    by the ActExecutor; the virtual plant and hardware kit both consume it."""
+    return f"cmd/{command_name}"
+
+
 @dataclass
 class TelemetryEnvelope:
     """Telemetry message on ``tele/<signal_id>`` (QoS 1, non-retained)."""

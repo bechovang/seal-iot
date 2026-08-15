@@ -43,3 +43,20 @@ llm:
 debate:
   role_order: [proposer, critic, arbiter]
   max_turns: 1
+
+# DECIDE objective weights (AD-6, reproducible winners) + candidate count.
+decide:
+  weights: {alpha: 0.5, beta: 0.15, gamma: 0.2, delta: 0.15}
+  candidate_count: 2
+
+# VERIFY outcome thresholds (AD-9), event-time sample windows (AD-10).
+verify:
+  window_samples: 20
+  improved_threshold: 0.3
+  worsened_threshold: 0.1
+
+# Incident FSM (AD-2).
+incident:
+  retry_max: 3
+  ttl_seconds_event: 3600
+  db_path: incident/incidents.db

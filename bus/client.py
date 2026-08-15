@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Iterable
 
-from .envelopes import tele_topic, stage_topic
+from .envelopes import command_topic, tele_topic, stage_topic
 
 MessageHandler = Callable[[str, dict[str, Any]], None]
 
@@ -103,6 +103,16 @@ class BusClient:
 
         env = StageEvent(event=event, source=source, ts=ts, payload=payload, episode_key=episode_key)
         self.transport.publish(stage_topic(stage), env.to_dict(), qos=1)
+
+    def publish_command(self, command_name: str, target: float, ts: str) -> None:
+        """Publish an approved actuator command on ``cmd/<command_name>``.
+        Callers must not publish to ``cmd/*`` directly — the executor is the sole
+        publisher (AD-7/AD-8). The LLM layer has no reference to this method."""
+        self.transport.publish(
+            command_topic(command_name),
+            {"command": command_name, "target": target, "ts": ts},
+            qos=1,
+        )
 
     def subscribe(self, prefix: str, handler: MessageHandler) -> None:
         self.transport.subscribe(prefix, handler)

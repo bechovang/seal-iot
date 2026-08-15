@@ -18,6 +18,12 @@ columns:
 pairing:
   - {signal: P1_FC_01, setpoint: P1_FC_01_D, feedback: P1_FC_01_Z}
   - {signal: P2_FC_08, setpoint: P2_FC_08_D, feedback: P2_FC_08_Z}
+# Actuator command registry (AD-8): safe envelope consumed by the shield AND the
+# plant model. Absolute engineering units. target = controlled signal; command_signal
+# = the actuator command the executor writes.
+commands:
+  - {name: fc_controller, target: P1_FC_01_Z, min: 0.0, max: 50.0, safe_min: 1.0, safe_max: 40.0, default: 10.0, unit: 'm3/h', energy_cost: 0.5, risk_baseline: 0.2, effect_gain: 0.9}
+  - {name: fc_controller_p2, target: P2_FC_08_Z, min: 0.0, max: 50.0, safe_min: 1.0, safe_max: 40.0, default: 8.0, unit: 'm3/h', energy_cost: 0.5, risk_baseline: 0.2, effect_gain: 0.9}
 # Asset topology (AD-5): the RCA agent reasons over these connections, mapping each
 # asset to its governing signals. Heuristic, not certified.
 topology:

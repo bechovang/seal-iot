@@ -55,6 +55,8 @@ class Diagnoser:
                 debate_mode="runbook_hit",
                 runbook_hit=True,
             )
+            d.signal_id = episode.signal_id
+            d.ts = _iso_from_epoch(episode.ts_epoch_ms)
         else:
             # identify involved signals = episode group + D/Z pair neighbors
             pair = self.mapping.pair_for(episode.signal_id)
@@ -64,6 +66,8 @@ class Diagnoser:
             graph = self.causal.build(involved, self.history)
             hyps = self.rca.rank(episode, self.mapping, graph, self.history)
             d = self.debate.run(episode, hyps, tokens)
+            d.signal_id = episode.signal_id
+            d.ts = _iso_from_epoch(episode.ts_epoch_ms)
         if self.bus is not None:
             ts = _iso_from_epoch(episode.ts_epoch_ms)
             self.bus.publish_event(

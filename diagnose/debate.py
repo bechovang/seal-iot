@@ -28,10 +28,13 @@ class Diagnosis:
     debate_mode: str = "debate"  # debate | single_pass_fallback
     hypotheses_json: dict = field(default_factory=dict)
     runbook_hit: bool = False
+    signal_id: str = ""
+    ts: str = ""
 
     def to_dict(self) -> dict:
         return {
             "episode_key": self.episode_key,
+            "signal_id": self.signal_id,
             "symptom_tokens": self.symptom_tokens,
             "root_cause": self.root_cause,
             "confidence": self.confidence,
@@ -39,6 +42,7 @@ class Diagnosis:
             "debate_mode": self.debate_mode,
             "hypotheses": self.hypotheses_json,
             "runbook_hit": self.runbook_hit,
+            "ts": self.ts,
         }
 
 
