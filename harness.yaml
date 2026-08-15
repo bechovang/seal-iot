@@ -1,0 +1,8 @@
+# Runtime knobs for the harness. Objective weights/shield rules belong to
+# Epics 2-3 (deferred); this epic consumes event rate + detection params.
+event_rate_hz: 1.0
+anomaly_gain: 1.0
+ema:
+  span: 20.0
+adwin:
+  delta: 0.002

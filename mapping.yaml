@@ -1,0 +1,32 @@
+dataset: HAI_21_03
+rate_hz: 1.0
+broker:
+  host: localhost
+  port: 1883
+# Canonical signal model. `source` is the HAI column name; `signal_id` is the
+# canonical area_kind_nn name the pipeline uses. Label columns are quarantined.
+columns:
+  - {signal_id: P1_FC_01, source: P1_FC101, unit: 'm3/h', kind: flow, area: P1}
+  - {signal_id: P1_P_01, source: P1_P101, unit: 'kPa', kind: pressure, area: P1}
+  - {signal_id: P1_FC_01_D, source: P1_FC101_D, unit: 'm3/h', kind: setpoint, area: P1}
+  - {signal_id: P1_FC_01_Z, source: P1_FC101_Z, unit: 'm3/h', kind: feedback, area: P1}
+  - {signal_id: P2_FC_08, source: P2_FC801, unit: 'm3/h', kind: flow, area: P2}
+  - {signal_id: P2_P_08, source: P2_P801, unit: 'kPa', kind: pressure, area: P2}
+  - {signal_id: P2_FC_08_D, source: P2_FC801_D, unit: 'm3/h', kind: setpoint, area: P2}
+  - {signal_id: P2_FC_08_Z, source: P2_FC801_Z, unit: 'm3/h', kind: feedback, area: P2}
+# Setpoint / feedback pairing: first-class evidence for D/Z divergence (AD-5).
+pairing:
+  - {signal: P1_FC_01, setpoint: P1_FC_01_D, feedback: P1_FC_01_Z}
+  - {signal: P2_FC_08, setpoint: P2_FC_08_D, feedback: P2_FC_08_Z}
+# Ground-truth labels. Readable ONLY by score/ (deferred); never by pipeline stages.
+label_columns:
+  - P1_normal
+  - P1_attack1
+  - P1_attack2
+  - P1_attack3
+  - P1_attack4
+  - P1_attack5
+  - P1_attack6
+  - P1_attack7
+  - P2_normal
+  - P2_attack1
