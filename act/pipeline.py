@@ -32,7 +32,9 @@ class GuardedActionPipeline:
         self.mapping = mapping
         self.bus = bus
         self.model = model or PlantModel()
-        self.decider = Decider(mapping, harness.decide, self.model)
+        self.decider = Decider(mapping, harness.decide, self.model,
+                               static=harness.variant.decide_static(),
+                               red_team=harness.variant.red_team)
         self.executor = ActExecutor(bus)
         self.incident_store = incident_store or IncidentStore(harness.incident.db_path,
                                                               harness.incident.retry_max,

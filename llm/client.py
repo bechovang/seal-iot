@@ -95,13 +95,26 @@ class LLMClient:
         return MockLLM(budget=self.budget)
 
     def complete_json(self, system: str, user: str) -> dict[str, Any] | None:
-        """Return a JSON dict, or None if the per-call-path budget is exhausted."""
+        """Return a JSON dict, or None if the per-call-path budget is exhausted.
+        Enforces a wall-clock guard (concurrent.futures) so a hung backend never
+        blocks the loop (AD-13 / 5.5): over-budget returns None -> fallback chain."""
         if self.calls >= self.budget:
             return None
-        out = self.backend.complete_json(system, user)
+        out = self._run_backend(system, user)
         if out is not None:
             self.calls += 1
         return out
+
+    def _run_backend(self, system: str, user: str) -> dict[str, Any] | None:
+        if self.config.max_wall_seconds <= 0:
+            return self.backend.complete_json(system, user)
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(self.backend.complete_json, system, user)
+            try:
+                return fut.result(timeout=self.config.max_wall_seconds)
+            except FutTimeout:
+                return None
 
     @property
     def exhausted(self) -> bool:

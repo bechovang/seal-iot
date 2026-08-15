@@ -13,6 +13,13 @@ uv.lock
 _bmad-output/
 excalidraw.log
 
+# Demo / runtime databases & logs
+demo/
+incident/*.db
+incident/*.db-wal
+incident/*.db-shm
+demo*/knowledge/runbooks*
+
 # OS
 .DS_Store
 Thumbs.db

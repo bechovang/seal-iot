@@ -210,6 +210,7 @@ class LLMConfig:
     default_model: str = "anthropic/claude-sonnet-4-20250514"
     budget_per_call_path: int = 3
     fallback: str = "single_pass"
+    max_wall_seconds: float = 8.0  # 5.5: wall-clock guard per call path
 
 
 @dataclass
@@ -239,6 +240,31 @@ class IncidentConfig:
 
 
 @dataclass
+class VariantConfig:
+    """Ablation arms / degraded modes (AD-6 / AD-13 / 5.6): never removes the shield."""
+    detector: str = "adwin"        # adwin | isolation_forest
+    diagnosis_mode: str = "full"    # full | rule_only
+    decide_mode: str = "whatif"     # whatif | static_priors
+    red_team: bool = False          # 5.5: inject known-bad candidates
+    llm_offline: bool = False       # force mock-LLM replay / no network
+
+    def rule_only(self) -> bool:
+        """True when the LLM must not be used (rehearsed offline/degraded mode)."""
+        return self.llm_offline or self.diagnosis_mode == "rule_only"
+
+    def decide_static(self) -> bool:
+        """True when DECIDE uses static command-registry priors instead of what-if sim."""
+        return self.decide_mode == "static_priors"
+
+
+@dataclass
+class DemoConfig:
+    ui_dir: str = "ui"
+    tts_clips_dir: str = "ui/tts_clips"
+    e2e_jsonl: str = "demo/e2e.jsonl"
+
+
+@dataclass
 class HarnessConfig:
     event_rate_hz: float = 1.0
     adwin_delta: float = 0.002
@@ -252,6 +278,8 @@ class HarnessConfig:
     decide: DecideConfig = field(default_factory=DecideConfig)
     verify: VerifyConfig = field(default_factory=VerifyConfig)
     incident: IncidentConfig = field(default_factory=IncidentConfig)
+    variant: VariantConfig = field(default_factory=VariantConfig)
+    demo: DemoConfig = field(default_factory=DemoConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "HarnessConfig":
@@ -269,6 +297,8 @@ class HarnessConfig:
             decide=_as(DecideConfig, cfg.get("decide", {})),
             verify=_as(VerifyConfig, cfg.get("verify", {})),
             incident=_as(IncidentConfig, cfg.get("incident", {})),
+            variant=_as(VariantConfig, cfg.get("variant", {})),
+            demo=_as(DemoConfig, cfg.get("demo", {})),
         )
 
 

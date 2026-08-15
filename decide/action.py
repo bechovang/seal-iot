@@ -64,7 +64,8 @@ class CandidateGenerator:
     def __init__(self, cfg: DecideConfig) -> None:
         self.cfg = cfg
 
-    def generate(self, mapping: Mapping, command: Command | None) -> list[ActionCandidate]:
+    def generate(self, mapping: Mapping, command: Command | None,
+                 red_team: bool = False) -> list[ActionCandidate]:
         cands: list[ActionCandidate] = [ActionCandidate(None, 0.0, is_noop=True)]
         if command is None:
             return cands
@@ -78,6 +79,12 @@ class CandidateGenerator:
         while len([c for c in cands if not c.is_noop]) < self.cfg.candidate_count:
             target = default - 0.5 * span * (len(cands))
             cands.append(ActionCandidate(command, _clamp_into(command, target)))
+        if red_team:
+            # 5.5: inject known-BAD candidates (outside the safe envelope) so the
+            # shield's block rate is measured against real risk, not vacuously zero.
+            bad_high = ActionCandidate(command, command.max * 1.5, from_llm=True)
+            bad_low = ActionCandidate(command, -0.5, from_llm=True)
+            cands.extend([bad_high, bad_low])
         return cands
 
 
@@ -86,10 +93,12 @@ def _clamp_into(command: Command, target: float) -> float:
 
 
 class ObjectiveScorer:
-    def __init__(self, model: PlantModel, cfg: DecideConfig, mapping: Mapping) -> None:
+    def __init__(self, model: PlantModel, cfg: DecideConfig, mapping: Mapping,
+                 static: bool = False) -> None:
         self.model = model
         self.cfg = cfg
         self.mapping = mapping
+        self.static = static  # 5.4: what-if sim -> static command-registry priors
 
     def score(self, candidate: ActionCandidate, baseline: float) -> CandidateScore:
         w = self.cfg.weights
@@ -108,6 +117,17 @@ class ObjectiveScorer:
             energy = _clamp(1.0 - candidate.command.energy_cost) if candidate.command else 0.0
             downtime = 1.0  # doing nothing leaves the breach in place -> max downtime
             risk = 0.8  # unhandled anomaly carries high residual risk
+        elif self.static:
+            # AD-13 degraded: no what-if simulation. Score from static command-registry
+            # priors only (safe envelope + default + target).
+            cmd = candidate.command
+            predicted = _clamp_into(cmd, candidate.target)
+            mid = 0.5 * (cmd.safe_min + cmd.safe_max)
+            span = max(cmd.safe_max - cmd.safe_min, 1e-9)
+            safety = _clamp(1.0 - abs(candidate.target - mid) / (span + 1e-9))
+            energy = _clamp(0.5 + 0.5 * (cmd.max - candidate.target) / max(cmd.max - cmd.safe_min, 1e-9))
+            downtime = _clamp(abs(candidate.target - cmd.default) / max(cmd.max - cmd.min, 1e-9))
+            risk = _clamp(_risk(candidate, baseline))
         else:
             cmd = candidate.command
             sim = self.model.predict(cmd, candidate.target, baseline)
@@ -162,17 +182,21 @@ class Decider:
     def __init__(
         self, mapping: Mapping, cfg: DecideConfig,
         model: PlantModel | None = None,
+        static: bool = False,
+        red_team: bool = False,
     ) -> None:
         self.mapping = mapping
         self.cfg = cfg
         self.model = model or PlantModel()
+        self.static = static
+        self.red_team = red_team
         self.gen = CandidateGenerator(cfg)
-        self.scorer = ObjectiveScorer(self.model, cfg, mapping)
+        self.scorer = ObjectiveScorer(self.model, cfg, mapping, static=static)
 
     def decide(
         self, diagnosis: dict, command: Command | None, baseline: float,
     ) -> dict:
-        candidates = self.gen.generate(self.mapping, command)
+        candidates = self.gen.generate(self.mapping, command, red_team=self.red_team)
         scored = [self.scorer.score(c, baseline) for c in candidates]
         scored.sort(key=lambda s: s.weighted, reverse=True)
         winner = scored[0]

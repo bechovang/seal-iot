@@ -60,3 +60,18 @@ incident:
   retry_max: 3
   ttl_seconds_event: 3600
   db_path: incident/incidents.db
+
+# Ablation arms / degraded modes (AD-6 / AD-13 / Epic 5.5-5.6). The shield is NEVER
+# disabled by a variant flag.
+variant:
+  detector: adwin            # adwin | isolation_forest
+  diagnosis_mode: full        # full | rule_only
+  decide_mode: whatif         # whatif | static_priors
+  red_team: false             # inject known-bad candidates (practice-only)
+  llm_offline: false          # force mock-LLM replay / rule-only offline
+
+# Rehearsal + demo (Epic 5).
+demo:
+  ui_dir: ui
+  tts_clips_dir: ui/tts_clips
+  e2e_jsonl: demo/e2e.jsonl

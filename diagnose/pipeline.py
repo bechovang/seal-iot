@@ -65,7 +65,20 @@ class Diagnoser:
                 involved += [pair.setpoint, pair.feedback]
             graph = self.causal.build(involved, self.history)
             hyps = self.rca.rank(episode, self.mapping, graph, self.history)
-            d = self.debate.run(episode, hyps, tokens)
+            if self.harness.variant.rule_only():
+                # AD-13: deterministic rule diagnosis — no LLM, no debate
+                top = hyps[0] if hyps else None
+                d = Diagnosis(
+                    episode_key=episode.episode_key,
+                    symptom_tokens=tokens,
+                    root_cause=top.root_cause if top else "unexplained deviation",
+                    confidence=(top.confidence if top else 0.2),
+                    action_hint="recalibrate",
+                    debate_mode="rule_only",
+                    hypotheses_json={"hypotheses": [h.to_dict() for h in hyps[:3]]},
+                )
+            else:
+                d = self.debate.run(episode, hyps, tokens)
             d.signal_id = episode.signal_id
             d.ts = _iso_from_epoch(episode.ts_epoch_ms)
         if self.bus is not None:

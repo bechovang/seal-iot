@@ -33,6 +33,31 @@ class InMemoryBus:
     def subscribe(self, prefix: str, handler: MessageHandler) -> None:
         self._subs.setdefault(prefix, []).append(handler)
 
+    def publish_command(self, command_name: str, target: float, ts: str) -> None:
+        """Mirror of BusClient.publish_command so offline runs / demos record the
+        sole-publisher contract on cmd/* (AD-7/AD-8)."""
+        self.publish(
+            command_topic(command_name),
+            {"command": command_name, "target": target, "ts": ts},
+            qos=1,
+        )
+
+    def publish_event(self, stage: str, event: str, source: str, ts: str,
+                     payload: dict[str, Any], episode_key: str | None = None) -> None:
+        from .envelopes import StageEvent, stage_topic
+
+        env = StageEvent(event=event, source=source, ts=ts, payload=payload,
+                         episode_key=episode_key)
+        self.publish(stage_topic(stage), env.to_dict(), qos=1)
+
+    def publish_telemetry(self, signal_id: str, ts: str, value: float,
+                         unit: str = "", quality: str = "ok") -> None:
+        from .envelopes import TelemetryEnvelope, tele_topic
+
+        env = TelemetryEnvelope(signal_id=signal_id, ts=ts, value=value, unit=unit,
+                               quality=quality)
+        self.publish(tele_topic(signal_id), env.to_dict(), qos=1)
+
 
 class PahoTransport:
     """Thin paho-mqtt transport used against a real broker."""
