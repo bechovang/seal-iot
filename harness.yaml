@@ -36,7 +36,7 @@ diagnosis:
 
 llm:
   provider: openrouter
-  default_model: anthropic/claude-sonnet-4-20250514
+  default_model: deepseek/deepseek-v4-flash-0731
   budget_per_call_path: 3
   fallback: single_pass
 
