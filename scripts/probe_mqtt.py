@@ -89,7 +89,9 @@ def main() -> int:
     password = os.environ.get("MQTT_PASS") or env.get("MQTT_PASS", "")
     topic = os.environ.get("MQTT_TOPIC") or env.get("MQTT_TOPIC", "")
     seconds = int(os.environ.get("MQTT_SECONDS", "30"))
-    tls = os.environ.get("MQTT_TLS", "").lower() in ("1", "true") or port == 8883
+    tls = os.environ.get("MQTT_TLS", "").lower() in ("1", "true") or port in (8883, 443)
+    transport = os.environ.get("MQTT_TRANSPORT", "websockets" if port == 443 else "tcp")
+    ws_path = os.environ.get("MQTT_WS_PATH", "/mqtt")
 
     if not host:
         print("ERROR: MQTT_HOST chua co. Dien host vao mqtt.env hoac set env var.")
@@ -121,10 +123,14 @@ def main() -> int:
         if len(payloads[msg.topic]) < 5:
             payloads[msg.topic].append(msg.payload)
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"probe-{int(time.time())}")
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"probe-{int(time.time())}",
+                         transport=transport)
     if user:
         client.username_pw_set(user, password)
-    if tls:
+    if transport == "websockets":
+        client.tls_set()  # wss: defaults: system CA, no client cert
+        client.ws_set_options(path=ws_path)
+    elif tls:
         client.tls_set()  # defaults: system CA, no client cert
     client.on_connect = on_connect
     client.on_subscribe = on_subscribe

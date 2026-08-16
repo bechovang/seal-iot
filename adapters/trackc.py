@@ -62,6 +62,7 @@ def parse_payload(raw: dict, registry: TrackCRegistry) -> ParseResult:
     team = str(raw.get("teamCode", "")).strip()
     res.meta["environment"] = raw.get("environment", "")
     res.meta["teamCode"] = team
+    res.meta["scenario"] = str(raw.get("scenario", ""))  # live frame carries NORMAL / anomaly
 
     # event-time clock: epoch wins (no TZ ambiguity), timestamp string fallback.
     ts, ts_quality = "", "ok"
@@ -158,6 +159,7 @@ def settings_from_env(path: str | os.PathLike | None = None) -> dict[str, Any]:
     never in code."""
     cfg: dict[str, Any] = {
         "host": "", "port": 1883, "user": "", "password": "", "tls": False,
+        "transport": "tcp", "ws_path": "/mqtt",
         "topic_prefix": "hackathon/underrated/", "env": "test",
         "team": "UNDERRATED", "environment": "FACTORY",
     }
@@ -174,8 +176,12 @@ def settings_from_env(path: str | os.PathLike | None = None) -> dict[str, Any]:
     cfg["port"] = int(os.environ.get("MQTT_PORT") or vals.get("MQTT_PORT", cfg["port"]))
     cfg["user"] = os.environ.get("MQTT_USER") or vals.get("MQTT_USER", cfg["user"])
     cfg["password"] = os.environ.get("MQTT_PASS") or vals.get("MQTT_PASS", cfg["password"])
+    port = cfg["port"]
     cfg["tls"] = (os.environ.get("MQTT_TLS") or vals.get("MQTT_TLS", "")).lower() in ("1", "true") \
-        or cfg["port"] == 8883
+        or port in (8883, 443)
+    cfg["transport"] = (os.environ.get("MQTT_TRANSPORT") or vals.get("MQTT_TRANSPORT") or
+                         ("websockets" if port == 443 else "tcp"))
+    cfg["ws_path"] = os.environ.get("MQTT_WS_PATH") or vals.get("MQTT_WS_PATH", "/mqtt")
     cfg["env"] = os.environ.get("MQTT_ENV") or vals.get("MQTT_ENV", cfg["env"])
     cfg["topic_prefix"] = os.environ.get("MQTT_TOPIC") or vals.get("MQTT_TOPIC", cfg["topic_prefix"])
     cfg["team"] = os.environ.get("TRACKC_TEAM") or vals.get("TRACKC_TEAM", cfg["team"])
@@ -207,10 +213,19 @@ class TrackCBridge:
             return False
         import paho.mqtt.client as mqtt
 
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="trackc-bridge")
+        transport = self.settings.get("transport", "tcp")
+        # The organizer broker terminates MQTT-over-WebSocket (wss) on 443; raw TLS
+        # TCP connect stays silent there. Force websockets transport for that port.
+        if int(self.settings.get("port") or 1883) == 443:
+            transport = "websockets"
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="trackc-bridge",
+                             transport=transport)
         if self.settings.get("user"):
             client.username_pw_set(self.settings["user"], self.settings.get("password", ""))
-        if self.settings.get("tls"):
+        if transport == "websockets":
+            client.tls_set()
+            client.ws_set_options(path=self.settings.get("ws_path", "/mqtt"))
+        elif self.settings.get("tls"):
             client.tls_set()
         client.connect(host, int(self.settings.get("port", 1883)), keepalive=30)
         client.loop_start()
