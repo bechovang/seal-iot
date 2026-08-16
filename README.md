@@ -104,5 +104,35 @@ PYTHONUTF8=1 uv run python harness_loop.py --log demo/e2e.jsonl --serve-ui 8799 
 | 4 | Tự học & đánh giá | ✅ |
 | 5 | Demo, khả năng phục hồi & trình bày | ✅ |
 
-Toàn bộ repo có **54 bài kiểm tra** (`PYTHONUTF8=1 make check`): 49 bài kiểm tra logic/an toàn + **5 bài test trên dữ liệu HAI 21.03 thật**
+Toàn bộ repo có **64 bài kiểm tra** (`PYTHONUTF8=1 make check`): 59 bài kiểm tra logic/an toàn + **5 bài test trên dữ liệu HAI 21.03 thật**
 (chạy trên `tai lieu/bo-du-lieu/03-HAI/`, tự bỏ qua nếu thiếu file). Một dòng thời gian sự kiện duy nhất, không dùng wall-clock trong pipeline.
+
+## Epic 5.2 — Control-Room Dashboard (English)
+
+The subscribe-only demo grew into a **control-room single-page app** that shows off the
+whole pipeline (perceive → diagnose → decide → shield → act → verify → FSM → self-learn)
+rather than just a subscribed feed. It is a pure, additive consumer:
+
+- **Backend emits** (`act/guard.py`, `act/pipeline.py`, `diagnose/pipeline.py`) publish
+  richer envelope events on `ops/decide`, `ops/verify`, `ops/shield`, `ops/incident` (FSM
+  trail), `ops/learn`, plus `ops/perceive` / `ops/result` / `ops/demo` and `tele/<id>`.
+- **`ui/dashboard.py`** aggregates those into a snapshot (`variant`, `signals`, `markers`,
+  `shield`, `decisions`, `verifies`, `fsm`, `learn`, `counters`) and **merges** the
+  episode-key → incident-id alias so perception folds into the one incident record. It
+  also serves `ui/app.html` via the stdlib `http.server`.
+- **`ui/app.html`** is a single-file ES2017 dark-theme SPA (no build step) that polls
+  `?json=1` every second: pipeline ribbon, D/Z telemetry chart with anomaly markers,
+  FSM stepper, ranked hypotheses + D/Z divergence + causal edges, objective/`do(∅)`
+  DECIDE table (with safety/energy/downtime/risk micro-bars), safety envelope number-line
+  for shield verdicts, verify gauge, self-learn runbooks/metrics, and a searchable trail.
+- **`ui/tts.py`** stays voice-only for meaningful stage events; control-room noise
+  (`ops/shield`, `ops/learn`, `ops/result`, `ops/demo`) is silently skipped (`SILENT_LEAVES`).
+
+Run it (watch mode replays a recorded demo in a loop and keeps the server alive):
+
+```bash
+PYTHONUTF8=1 uv run python harness_loop.py --log demo/controlroom.jsonl --watch
+# open http://127.0.0.1:8765  (or `make ui`)
+```
+
+Legacy single-round demo with TTS stays available via `--serve-ui <port> --tts`.

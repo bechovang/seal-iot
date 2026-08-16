@@ -30,6 +30,8 @@ class Diagnosis:
     runbook_hit: bool = False
     signal_id: str = ""
     ts: str = ""
+    divergence: dict = field(default_factory=dict)
+    causal_edges: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -43,6 +45,8 @@ class Diagnosis:
             "hypotheses": self.hypotheses_json,
             "runbook_hit": self.runbook_hit,
             "ts": self.ts,
+            "divergence": self.divergence,
+            "causal_edges": self.causal_edges,
         }
 
 

@@ -1,10 +1,11 @@
-"""Subscribe-only demo dashboard (Epic 5.2 / AD-14).
+"""Subscribe-only demo dashboard (Epic 5.2 / AD-14) — control-room aggregation.
 
-A zero-build, static/serve-only consumer: it subscribes to ``ops/*`` and ``cmd/*``
-and renders a per-incident / per-stage stopwatch plus the recent event trail. It is
-purely a consumer — with the dashboard process killed the loop keeps running. Latency
-is derived from the event timestamp column (single clock), not from wall clock, so a
-natural HAI attack expiry is never mistaken for improvement (5.6).
+A zero-build, static/serve-only consumer: subscribes to ``ops/*``, ``cmd/*`` and
+``tele/*`` and aggregates the full pipeline story (perceive -> diagnose -> decide ->
+shield -> verify -> FSM -> learn) into a snapshot that the SPA (``ui/app.html``)
+polls at ~1s. It is purely a consumer — with the dashboard killed the loop keeps
+running. Latency is derived from the event timestamp column (single clock), not from
+wall clock, so a natural HAI attack expiry is never mistaken for improvement (5.6).
 
 Uses only the standard library.
 """
@@ -14,14 +15,17 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 STAGES = ["perceive", "diagnose", "decide", "act", "verify", "incident"]
 
+
 # match ephemeral 'incident_id' inside event payloads when present
 def _lookup_id(payload: dict) -> str | None:
-    for k in ("incident_id", "episode_key", "episode_key"):
+    for k in ("incident_id", "episode_key"):
         if k in payload:
             return str(payload[k])
     return None
@@ -47,55 +51,197 @@ def iso_ms(ts: str | int) -> int | None:
 class Dashboard:
     """Collects events and answers a per-incident snapshot (thread-safe).
 
-    Additive fields (state, last_stage, pipeline_counts) are exposed in :meth:`snapshot`
-    without changing the stable keys the tests rely on.
+    Legacy keys (incidents, stage_counts, recent, pipeline_counts, elapsed_s) are
+    unchanged; additive keys (variant, signals, markers, shield, decisions, verifies,
+    fsm, learn, counters) power the control-room SPA.
     """
 
-    def __init__(self, max_events: int = 200) -> None:
+    def __init__(self, max_events: int = 200, series_points: int = 240) -> None:
         self._lock = threading.Lock()
-        self._events: list[dict[str, Any]] = []
+        self._events: list[dict[str, Any]] = []  # ring: ops/* and cmd/* only
         self.max_events = max_events
-        self.start_ts = time.time()  # UI-only wall clock for 'elapsed' display
+        self.series_points = series_points
+        self.start_ts = time.time()
 
+        self._stage_counts: dict[str, int] = {}
+        self._series: dict[str, dict] = {}     # signal_id -> {unit, points deque}
+        self._decisions: "OrderedDict[str, dict]" = OrderedDict()
+        self._verifies: "OrderedDict[str, dict]" = OrderedDict()
+        self._diagnoses: "OrderedDict[str, dict]" = OrderedDict()
+        self._fsm: "OrderedDict[str, list]" = OrderedDict()
+        self._shield: list[dict] = []
+        self._learn: "OrderedDict[str, dict]" = OrderedDict()
+        self._markers: list[dict] = []          # {ts_ms, kind, label}
+        self._alias: dict[str, str] = {}        # episode_key -> incident_id
+        self._counters = {"tele": 0, "cmd": 0, "ops": 0, "shield_blocked": 0,
+                          "runbook_hits": 0, "rounds": 0}
+        self._variant = ""
+
+    # -- normalization -------------------------------------------------------
+    @staticmethod
+    def _normalize(payload: dict) -> dict:
+        """Unwrap a versioned envelope so downstream sees the inner event payload.
+        A flat payload passes through unchanged. Best-effort: a schema_version or a
+        dict-valued ``payload`` signals an envelope."""
+        if isinstance(payload, dict) and isinstance(payload.get("payload"), dict):
+            inner = payload.get("payload") or {}
+            # keep the envelope's episode_key/ts as fallbacks
+            if inner.get("episode_key") is None and payload.get("episode_key"):
+                inner["episode_key"] = payload["episode_key"]
+            return inner
+        return payload
+
+    # -- routing -------------------------------------------------------------
     def handler(self, topic: str, payload: dict) -> None:
+        inner = self._normalize(payload)
+        if topic.startswith("tele/"):
+            with self._lock:
+                self._ingest_tele(topic, inner)
+            return
         with self._lock:
-            rec = {"topic": topic, "payload": payload}
-            self._events.append(rec)
+            self._ingest_op(topic, payload, inner)
+
+    def _ingest_tele(self, topic: str, inner: dict) -> None:
+        self._counters["tele"] += 1
+        sig = inner.get("signal_id") or topic.rsplit("/", 1)[-1]
+        s = self._series.setdefault(sig, {"unit": inner.get("unit", ""), "points": []})
+        if inner.get("unit"):
+            s["unit"] = inner["unit"]
+        pts = s["points"]
+        pts.append({"ts_ms": iso_ms(inner.get("ts") or inner.get("ts_ms")),
+                    "value": inner.get("value"), "phase": inner.get("phase", "")})
+        del pts[:-self.series_points]
+
+    def _ingest_op(self, topic: str, payload: dict, inner: dict) -> None:
+        self._counters["ops"] += 1
+        leaf = topic.rsplit("/", 1)[-1]
+        stage = "act" if topic.startswith("cmd/") else leaf
+        if not topic.startswith("tele/"):
+            self._stage_counts[stage] = self._stage_counts.get(stage, 0) + 1
+        # ops/cmd go to the recent ring too (never tele -> avoids flood)
+        if topic.startswith("cmd/") or topic.startswith("ops/"):
+            self._events.append({"topic": topic, "payload": payload})
             if len(self._events) > self.max_events:
                 self._events = self._events[-self.max_events:]
 
+        iid = _lookup_id(inner) or _lookup_id(payload)
+        # learn the episode_key -> incident_id alias so perceive/diagnose (which only
+        # know episode_key) merge into the one incident the decide/result minted.
+        ek = inner.get("episode_key") or payload.get("episode_key")
+        inc = inner.get("incident_id") or payload.get("incident_id")
+        if ek and inc and ek != inc:
+            self._alias[ek] = inc
+            iid = inc
+
+        if topic.startswith("cmd/"):
+            self._counters["cmd"] += 1
+            self._markers.append({"ts_ms": iso_ms(inner.get("ts") or inner.get("ts_ms")),
+                                  "kind": "action", "label": leaf,
+                                  "incident_id": iid})
+        elif leaf == "shield":
+            self._shield.append({"incident_id": iid,
+                                 "action": inner.get("action"),
+                                 "target": inner.get("target"),
+                                 "allowed": inner.get("allowed"),
+                                 "reason": inner.get("reason"),
+                                 "envelope_abs": inner.get("envelope_abs"),
+                                 "ts": inner.get("ts")})
+            if inner.get("allowed") is False:
+                self._counters["shield_blocked"] += 1
+                self._markers.append({"ts_ms": iso_ms(inner.get("ts") or inner.get("ts_ms")),
+                                      "kind": "blocked", "label": str(inner.get("action") or "?"),
+                                      "incident_id": iid})
+        elif leaf == "decide" and iid is not None:
+            self._decisions[iid] = dict(inner)
+            self._prune(self._decisions)
+        elif leaf == "verify" and iid is not None:
+            self._verifies[iid] = dict(inner)
+            self._prune(self._verifies)
+        elif leaf == "diagnose" and iid is not None:
+            self._diagnoses[iid] = dict(inner)
+            self._counters["runbook_hits"] += (1 if inner.get("runbook_hit") else 0)
+            if inner.get("runbook_hit"):
+                self._markers.append({"ts_ms": iso_ms(inner.get("ts") or inner.get("ts_ms")),
+                                      "kind": "runbook", "label": "hit", "incident_id": iid})
+            self._prune(self._diagnoses)
+        elif leaf == "incident" and iid is not None:
+            trail = self._fsm.setdefault(iid, [])
+            trail.append({"incident_id": iid,
+                          "episode_key": inner.get("episode_key"),
+                          "event": inner.get("event"),
+                          "from_state": inner.get("from_state"),
+                          "to_state": inner.get("to_state"),
+                          "retries": inner.get("retries", 0),
+                          "ts": inner.get("ts")})
+            del trail[:-64]
+        elif leaf == "learn" and iid is not None:
+            self._learn[iid] = dict(inner)
+            self._prune(self._learn, cap=50)
+        elif leaf == "perceive":
+            self._markers.append({"ts_ms": iso_ms(inner.get("ts") or inner.get("ts_ms")),
+                                  "kind": "anomaly", "label": inner.get("detector") or "?",
+                                  "incident_id": iid})
+        elif leaf == "result":
+            self._markers.append({"ts_ms": iso_ms(inner.get("ts") or inner.get("ts_ms")),
+                                  "kind": "result", "label": inner.get("state") or "?",
+                                  "incident_id": iid})
+        elif leaf == "demo":
+            self._variant = str(inner.get("variant") or "")
+            self._counters["rounds"] = int(inner.get("round") or 0)
+
+    @staticmethod
+    def _prune(od, cap: int = 100) -> None:
+        while len(od) > cap:
+            od.popitem(last=False)
+
+    # -- snapshot ------------------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             events = list(self._events)
+            stage_counts = dict(self._stage_counts)
+            series = {k: {"unit": v["unit"], "points": list(v["points"])}
+                      for k, v in self._series.items()}
+            decisions = dict(self._decisions)
+            verifies = dict(self._verifies)
+            diagnoses = dict(self._diagnoses)
+            fsm = {k: list(v) for k, v in self._fsm.items()}
+            shield = list(self._shield)
+            learn = dict(self._learn)
+            markers = list(self._markers)
+            alias = dict(self._alias)
+            counters = dict(self._counters)
+            variant = self._variant
+
+        # legacy per-incident fidelity (unchanged behaviour + alias merge)
         incidents: dict[str, dict] = {}
         stages: dict[str, int] = {}
         for rec in events:
             topic = rec["topic"]
-            payload = rec["payload"]
-            stage = topic.split("/")[-1]
-            # normalise a leaf like cmd/fc_controller to 'act'
-            if topic.startswith("cmd/"):
-                stage = "act"
+            payload_rec = rec["payload"]
+            inner = self._normalize(payload_rec)
+            leaf = topic.split("/")[-1]
+            stage = "act" if topic.startswith("cmd/") else leaf
             stages[stage] = stages.get(stage, 0) + 1
-            iid = _lookup_id(payload)
+            iid = _lookup_id(inner) or _lookup_id(payload_rec)
             if iid is None:
                 continue
+            # resolve episode_key -> incident_id so perceive/diagnose fold in
+            if iid in alias:
+                iid = alias[iid]
             d = incidents.setdefault(
                 iid, {"id": iid, "stages": {}, "order": [], "last_ts": None,
                        "state": None, "state_ts": None}
             )
-            now = iso_ms(payload.get("ts") or payload.get("ts_ms"))
+            now = iso_ms(inner.get("ts") or inner.get("ts_ms"))
             d["stages"][stage] = rec
             if stage not in d["order"]:
                 d["order"].append(stage)
             if now is not None and (d["last_ts"] is None or d["last_ts"] < now):
                 d["last_ts"] = now
-            # capture the latest FSM state (e.g. RESOLVED / ACTING) if present
-            state = payload.get("state") or (payload.get("outcome") or {}).get("classification")
+            state = inner.get("state") or (inner.get("outcome") or {}).get("classification")
             if state is not None and (d["state_ts"] is None or now is None or d["state_ts"] <= (now or 0)):
                 d["state"] = str(state)
                 d["state_ts"] = now
-        # per-stage latency (ms) by event-timestamp gaps within each incident
         for d in incidents.values():
             order = d["order"]
             lat = {}
@@ -103,8 +249,8 @@ class Dashboard:
             prev_stage = None
             for st in STAGES:
                 if st in d["stages"]:
-                    ts = iso_ms(d["stages"][st]["payload"].get("ts")
-                                or d["stages"][st]["payload"].get("ts_ms"))
+                    inner = self._normalize(d["stages"][st]["payload"])
+                    ts = iso_ms(inner.get("ts") or inner.get("ts_ms"))
                     if prev is not None and ts is not None:
                         lat[f"{prev_stage}->{st}"] = max(0, ts - prev)
                     prev, prev_stage = ts, st
@@ -115,6 +261,17 @@ class Dashboard:
             "incidents": list(incidents.values()),
             "recent": events[-40:],
             "pipeline_counts": {s: stages.get(s, 0) for s in STAGES},
+            # additive control-room keys
+            "variant": variant,
+            "signals": series,
+            "markers": markers,
+            "shield": shield,
+            "decisions": decisions,
+            "verifies": verifies,
+            "diagnoses": diagnoses,
+            "fsm": fsm,
+            "learn": learn,
+            "counters": counters,
         }
 
 
@@ -128,7 +285,7 @@ def _stage_color(st: str) -> str:
     return {
         "perceive": "#4ea1ff", "diagnose": "#b388ff", "decide": "#ffb04d",
         "act": "#ff7a59", "verify": "#37d67a", "incident": "#ff5c8a",
-        "cmd": "#ff7a59",
+        "cmd": "#ff7a59", "learn": "#ffd166",
     }.get(st, "#8c9baf")
 
 
@@ -142,9 +299,8 @@ def _render(admin: BaseHTTPRequestHandler, data: dict, as_json: bool = False) ->
     if as_json:
         j = json.dumps(data, ensure_ascii=False, indent=1)
         body = j.encode("utf-8")
-        ctype = "application/json; charset=utf-8"
         admin.send_response(200)
-        admin.send_header("Content-Type", ctype)
+        admin.send_header("Content-Type", "application/json; charset=utf-8")
         admin.send_header("Content-Length", str(len(body)))
         admin.end_headers()
         admin.wfile.write(body)
@@ -210,11 +366,34 @@ def _render(admin: BaseHTTPRequestHandler, data: dict, as_json: bool = False) ->
     admin.wfile.write(body)
 
 
+def _read_spa() -> bytes:
+    """Read ui/app.html once if present (SPA), else None -> fall back to _render."""
+    p = Path(__file__).with_name("app.html")
+    if not p.exists():
+        return b""
+    return p.read_bytes()
+
+
+_SPA = _read_spa()
+
+
 def serve(dash: Dashboard, host: str, port: int) -> ThreadingHTTPServer:
     """Serve the dashboard snapshot over plain stdlib HTTP; call with a thread.
-    ``/?json=1`` returns the raw JSON snapshot instead of the HTML view."""
+    ``/?json=1`` or ``/api/*`` returns the raw JSON snapshot. With ui/app.html present
+    the root serves the single-file SPA; otherwise the legacy HTML view."""
     def _do_get(self):
-        _render(self, dash.snapshot(), as_json="json" in self.path)
+        path = self.path.split("?", 1)[0]
+        if "json=1" in self.path or path.startswith("/api/"):
+            _render(self, dash.snapshot(), as_json=True)
+        elif _SPA and path in ("/", ""):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(_SPA)))
+            self.end_headers()
+            self.wfile.write(_SPA)
+        else:
+            _render(self, dash.snapshot(), as_json=False)
+
     server = ThreadingHTTPServer(
         (host, port),
         type("H", (BaseHTTPRequestHandler,), {

@@ -55,6 +55,26 @@ class ActExecutor:
 
     def execute(self, action: Action, ts: str, incident_key: str = "") -> dict:
         verdict = SafetyShield().evaluate(action)
+        # publish the verdict itself (alongside action_status) so the UI can render
+        # the interlock decision with the envelope it was judged against
+        if hasattr(self.bus, "publish_event"):
+            cmd = action.command
+            self.bus.publish_event(
+                "shield", "act", "shield", ts,
+                {
+                    "incident_id": incident_key,
+                    "action": cmd.name if cmd else None,
+                    "target": action.target,
+                    "allowed": verdict.allowed,
+                    "reason": verdict.reason,
+                    "envelope_abs": (
+                        {"min": cmd.min, "max": cmd.max,
+                         "safe_min": cmd.safe_min, "safe_max": cmd.safe_max}
+                        if cmd else None
+                    ),
+                },
+                episode_key=incident_key,
+            )
         if not verdict.allowed:
             self.bus.publish_event(
                 "action_status", "act", "shield_blocked", ts,

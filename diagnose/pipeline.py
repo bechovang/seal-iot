@@ -44,6 +44,14 @@ class Diagnoser:
         from .rca import compute_divergence
 
         div = compute_divergence(self.mapping, self.history, episode.signal_id)
+        div_dict = {
+            "setpoint_mean": div.setpoint_mean,
+            "feedback_mean": div.feedback_mean,
+            "divergence": div.divergence,
+            "setpoint_std": div.setpoint_std,
+            "hypothesis_type": div.hypothesis_type,
+            "rationale": div.rationale,
+        }
         runbook, tokens = self.matcher.match(episode, self.mapping, divergence=div.divergence)
         if runbook is not None:
             d = Diagnosis(
@@ -57,6 +65,7 @@ class Diagnoser:
             )
             d.signal_id = episode.signal_id
             d.ts = _iso_from_epoch(episode.ts_epoch_ms)
+            d.divergence = div_dict
         else:
             # identify involved signals = episode group + D/Z pair neighbors
             pair = self.mapping.pair_for(episode.signal_id)
@@ -81,6 +90,9 @@ class Diagnoser:
                 d = self.debate.run(episode, hyps, tokens)
             d.signal_id = episode.signal_id
             d.ts = _iso_from_epoch(episode.ts_epoch_ms)
+            d.divergence = div_dict
+            edges = CausalGraphBuilder.describe(graph)
+            d.causal_edges = edges
         if self.bus is not None:
             ts = _iso_from_epoch(episode.ts_epoch_ms)
             self.bus.publish_event(

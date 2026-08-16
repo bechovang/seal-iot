@@ -20,11 +20,16 @@ EVENT_CLIPS = {
     "incident": "incident.mp3",
 }
 
+# control-room-noise: these additive topics are visual-only and must not be spoken.
+SILENT_LEAVES = {"demo", "learn", "result", "action_status", "shield"}
+
 
 def _stage_of(topic: str) -> str:
     if topic.startswith("cmd/"):
         return "act"
     leaf = topic.rsplit("/", 1)[-1]
+    if leaf in SILENT_LEAVES:
+        return None
     return leaf if leaf in EVENT_CLIPS else "incident"
 
 
@@ -52,6 +57,8 @@ class VTTSAnnouncer:
 
     def handler(self, topic: str, payload: dict) -> None:
         stage = _stage_of(topic)
+        if stage is None:
+            return
         clip = self._clip(stage)
         if clip is None:
             return
