@@ -182,6 +182,9 @@
     </div>
   </div>
 
+  <h2>Track C · coordination tasks</h2>
+  <div class="panel" id="tdtasks"></div>
+
   <h2>Event trail</h2>
   <div class="panel" id="trail"></div>
 
@@ -440,6 +443,22 @@ function renderLearn(s){
   }).join("");
   el.innerHTML=html||"<div class='empty'>no learn payload yet</div>";
 }
+var TASKSTAGE={observe:"Observe",plan:"Plan",analyze:"Analyze",adjudicate:"Adjudicate",
+               act:"Act",verify:"Verify",report:"Report"};
+function renderTasks(s){
+  var el=document.getElementById("tdtasks");
+  var tasks=(s.tasks?Object.keys(s.tasks).map(function(k){return s.tasks[k];}):[]).reverse();
+  if(!tasks.length){el.innerHTML="<div class='empty'>no coordination tasks yet</div>";return;}
+  el.innerHTML=tasks.map(function(t){
+    var last=t.events[t.events.length-1]||"";
+    var badge=last==="closed"?"b-green":(last==="approval_requested"?"b-gold":"b-pink");
+    var stages=(t.stage?["<span class='chip' style='border-color:var(--blue)'>"+esc(TASKSTAGE[t.stage]||t.stage)+"</span>"]:[]).join("");
+    var evs=(t.events||[]).slice(-8).map(function(e){return "<span class='tchip' style='background:#2b3a55'>"+esc(e)+"</span>";}).join(" ");
+    return "<div class='card'><div class='card-h'><span class='iid'>"+esc(t.task_id)+"</span>"+
+      "<span class='badge "+badge+"'>"+esc(last)+"</span><span class='muted'>"+esc(t.ts||"")+"</span></div>"+
+      "<div>"+stages+"</div><div style='margin-top:6px'>"+evs+"</div></div>";
+  }).join("");
+}
 function renderTrail(s){
   var el=document.getElementById("trail");
   var evts=(s.recent||[]).slice().reverse();
@@ -474,7 +493,7 @@ var lastSections={};
 function tick(){
   fetch("?json=1").then(function(r){return r.json();}).then(function(s){
     var secs={header:s,pipeline:s,chart:s,incidents:s,diagnose:s,decide:s,
-              shield:s,verify:s,learn:s,trail:s};
+              shield:s,verify:s,learn:s,trail:s,tasks:s};
     if(lastSections.header!==JSON.stringify([s.variant,s.counters,s.elapsed_s]))renderHeader(s);
     if(lastSections.pipeline!==JSON.stringify(s.pipeline_counts||{}))renderPipeline(s);
     if(lastSections.chart!==JSON.stringify(s.signals||{}))renderChart(s);
@@ -485,6 +504,8 @@ function tick(){
     if(lastSections.verify!==JSON.stringify(s.verifies||{}))renderVerify(s);
     if(lastSections.learn!==JSON.stringify(s.learn||{}))renderLearn(s);
     if(lastSections.trail!==JSON.stringify(s.recent||{}))renderTrail(s);
+    if(lastSections.tasks!==JSON.stringify(s.tasks||{}))renderTasks(s);
+    lastSections.tasks=JSON.stringify(s.tasks||{});
     lastSections.header=JSON.stringify([s.variant,s.counters,s.elapsed_s]);
     lastSections.pipeline=JSON.stringify(s.pipeline_counts||{});
     lastSections.chart=JSON.stringify(s.signals||{});

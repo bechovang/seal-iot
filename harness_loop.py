@@ -225,6 +225,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tts", action="store_true", help="enable the Vietnamese TTS announcer (5.3)")
     ap.add_argument("--watch", type=int, default=0, nargs="?", const=100,
                     help="run the demo in a continuous loop (default 100 rounds) so the\n                    dashboard stays live; Ctrl+C to stop")
+    ap.add_argument("--trackc", default="",
+                    help="run one Track C coordination task (text) instead of the sim loop; "
+                         "e.g. --trackc 'prepare inspection of motor 1'")
+    ap.add_argument("--trackc-playbook", default="auto",
+                    help="explicit playbook id for --trackc (default: auto-match)")
+    ap.add_argument("--trackc-approve", default="all", choices=["all", "first", "deny", "none"],
+                    help="approval decisions to make during --trackc")
     args = ap.parse_args(argv)
 
     harness = HarnessConfig.load()
@@ -254,6 +261,62 @@ def main(argv: list[str] | None = None) -> int:
         _th.Thread(target=srv.serve_forever, daemon=True).start()
         print(f"control-room on http://127.0.0.1:{port}" if args.watch
               else f"dashboard on http://127.0.0.1:{port}")
+
+    if args.trackc:
+        # Track C (AD-1..8/12): run ONE request-driven coordination task over the same
+        # bus the dashboard consumes. The request path is the judged path; the sim
+        # (P-D-S-A) loop above stays untouched. Returns a summary + rendered trail.
+        from config import HarnessConfig as _H, load_mapping as _lm, TrackCRegistry
+        from history import HistoryBuffer
+        from orchestration import TaskStore, Supervisor
+        from tools import CMMSSim, ToolPort
+        from adapters import TrackCSim, parse_payload
+
+        _reg = _lm().trackc
+        _store = TaskStore("orchestration/tasks.db")
+        _cmms = CMMSSim("tools/cmms.db")
+        _port = ToolPort(_cmms, _reg,
+                         lambda tid: _store.get(tid).state if tid else None,
+                         db_path="tools/port_keys.db", bus=bus)
+        _hist = HistoryBuffer("demo/trackc_history.db")
+        _sim = TrackCSim(_reg)
+
+        def _iso_ms(s):
+            from datetime import datetime
+
+            return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() * 1000)
+
+        for k in range(20):
+            for e in parse_payload(_sim.tick(k), _reg).envelopes:
+                _hist.write(e.signal_id, _iso_ms(e.ts), e.value, e.quality)
+        _sup = Supervisor(_store, _reg, harness.trackc, bus=bus, port=_port,
+                          history=_hist, cmms=_cmms, mode="live")
+
+        pb = args.trackc_playbook if args.trackc_playbook != "auto" else None
+        mint = (_sup.ingest_request if pb else _sup.ingest_request)
+        r = mint(args.trackc, pb or "prepare_inspection")
+        tid = r["task_id"]
+        approvals_made = 0
+        guard = 0
+        while _store.get(tid).state not in ("REPORTED", "PARTIAL", "FAILED", "CANCELLED") and guard < 8:
+            st = _store.get(tid).state
+            _sup.advance(tid)
+            if _store.get(tid).state == "AWAITING_APPROVAL":
+                apr = _store.get(tid).approval_request_id
+                if args.trackc_approve == "deny" and approvals_made == 0:
+                    _sup.handle_approval(tid, {"approval_id": apr, "decision": "DENIED"})
+                else:
+                    _sup.handle_approval(tid, {"approval_id": apr, "decision": "APPROVED"})
+                    approvals_made += 1
+            guard += 1
+        from orchestration.replay import render_trail
+        print(f"Track C task {tid} -> {_store.get(tid).state} "
+              f"(work_orders={len(_cmms.lookup('work_orders'))}, "
+              f"reports={len(_cmms.lookup('reports'))}, approvals={approvals_made})")
+        print("---- replay-as-render (no execution) ----")
+        print("\n".join(render_trail(bus.messages)))
+        recorder.close()
+        return 0
 
     if args.replay:
         # AD-14: feed the recorded log into a handler; NEVER append to the source log

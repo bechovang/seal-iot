@@ -4,8 +4,14 @@ install:
 	uv sync
 
 lint:
-	uv run python -m compileall -q config.py harness_loop.py adapters act bus decide diagnose history incident knowledge learn llm perceive plant_model score verify bus ui
+	uv run python -m compileall -q config.py harness_loop.py adapters act bus decide diagnose history incident knowledge learn llm orchestration perceive plant_model score verify bus ui tools
 	@echo "lint ok"
+
+# Track C: run one request-driven coordination task over the harness, then render
+# its recorded trail as replay-as-render (AD-13). Add --trackc-approve deny for the
+# DENIED -> PARTIAL drill.
+trackc:
+	PYTHONUTF8=1 uv run python harness_loop.py --trackc "prepare inspection of motor 1" --trackc-playbook prepare_inspection --trackc-approve all
 
 test:
 	uv run pytest -q

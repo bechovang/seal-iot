@@ -29,3 +29,11 @@ tai lieu/bo-du-lieu/
 
 # Secrets
 mqtt.env
+
+# Track C runtime state (regenerated on run)
+orchestration/*.db
+orchestration/*.db-wal
+orchestration/*.db-shm
+tools/*.db
+tools/*.db-wal
+tools/*.db-shm
