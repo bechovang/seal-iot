@@ -76,6 +76,10 @@ class Dashboard:
         self._counters = {"tele": 0, "cmd": 0, "ops": 0, "shield_blocked": 0,
                           "runbook_hits": 0, "rounds": 0}
         self._variant = ""
+        # Track C (AD-1/AD-5): the dashboard is the SOLE publisher of request/in and
+        # approval/<task_id>; it also aggregates task/* it consumes from the supervisor.
+        self._pub = None        # set_publisher(busPublishable)
+        self._tasks: "OrderedDict[str, dict]" = OrderedDict()
 
     # -- normalization -------------------------------------------------------
     @staticmethod
@@ -98,8 +102,65 @@ class Dashboard:
             with self._lock:
                 self._ingest_tele(topic, inner)
             return
+        if topic.startswith("task/"):
+            with self._lock:
+                self._ingest_task(topic, inner)
+            return
         with self._lock:
             self._ingest_op(topic, payload, inner)
+
+    # -- Track C: sole publisher of request/in + approval/<task_id> (AD-5) ---
+    def set_publisher(self, pub) -> None:
+        """Attach a bus-publishable (InMemoryBus, or a transport the harness wires)."""
+        self._pub = pub
+
+    def publish_request(self, text: str, playbook_id: str | None = None,
+                        priority: str | None = None, in_reply_to: str | None = None) -> dict:
+        """Render a human request into the request/in topic. The dashboard is the
+        only publisher of this family (AD-5); the supervisor is the only consumer."""
+        from bus.envelopes import request_topic
+
+        if self._pub is None:
+            return {"published": False, "reason": "no publisher attached"}
+        payload: dict[str, Any] = {"text": text, "request_text": text}
+        if playbook_id:
+            payload["playbook_id"] = playbook_id
+        if priority:
+            payload["priority"] = priority
+        if in_reply_to:
+            payload["in_reply_to"] = in_reply_to
+        self._pub.publish(request_topic(), payload, qos=1)
+        return {"published": True}
+
+    def publish_decision(self, task_id: str, approval_id: str, decision: str) -> dict:
+        """Render an operator decision into approval/<task_id>. Sole publisher of this
+        family as well (AD-5/AD-8)."""
+        from bus.envelopes import approval_topic
+
+        if self._pub is None:
+            return {"published": False, "reason": "no publisher attached"}
+        if decision not in ("APPROVED", "DENIED"):
+            return {"published": False, "reason": "decision must be APPROVED|DENIED"}
+        payload = {"approval_id": approval_id, "decision": decision}
+        self._pub.publish(approval_topic(task_id), payload, qos=1)
+        return {"published": True}
+
+    def _ingest_task(self, topic: str, inner: dict) -> None:
+        """Aggregate task/* frames into a per-task control card the SPA can render."""
+        parts = topic.split("/")
+        task_id = parts[1] if len(parts) > 1 else ""
+        event = parts[-1]
+        rec = self._tasks.setdefault(task_id, {"task_id": task_id, "events": [],
+                                                "stage": "", "state": "", "ts": ""})
+        rec["events"].append(inner.get("event") or event)
+        del rec["events"][:-128]
+        if inner.get("stage_name"):
+            rec["stage"] = inner["stage_name"]
+        st = inner.get("payload") if isinstance(inner.get("payload"), str) else None
+        rec["state"] = inner.get("agent") or rec["state"]
+        if inner.get("ts") and inner.get("event") in ("opened", "closed"):
+            rec["ts"] = inner["ts"]
+        self._prune(self._tasks, cap=128)
 
     def _ingest_tele(self, topic: str, inner: dict) -> None:
         self._counters["tele"] += 1
@@ -211,6 +272,7 @@ class Dashboard:
             alias = dict(self._alias)
             counters = dict(self._counters)
             variant = self._variant
+            tasks = dict(self._tasks)
 
         # legacy per-incident fidelity (unchanged behaviour + alias merge)
         incidents: dict[str, dict] = {}
@@ -272,6 +334,7 @@ class Dashboard:
             "fsm": fsm,
             "learn": learn,
             "counters": counters,
+            "tasks": tasks,
         }
 
 
@@ -379,8 +442,11 @@ _SPA = _read_spa()
 
 def serve(dash: Dashboard, host: str, port: int) -> ThreadingHTTPServer:
     """Serve the dashboard snapshot over plain stdlib HTTP; call with a thread.
-    ``/?json=1`` or ``/api/*`` returns the raw JSON snapshot. With ui/app.html present
-    the root serves the single-file SPA; otherwise the legacy HTML view."""
+    ``/?json=1`` or ``/api/snapshot`` returns the raw JSON snapshot. With ui/app.html
+    present the root serves the single-file SPA; otherwise the legacy HTML view.
+
+    Track C write endpoints (AD-5): GET answers, POST mutates the coordination layer.
+    The dashboard is the SOLE publisher of request/in + approval/<task_id>."""
     def _do_get(self):
         path = self.path.split("?", 1)[0]
         if "json=1" in self.path or path.startswith("/api/"):
@@ -394,10 +460,47 @@ def serve(dash: Dashboard, host: str, port: int) -> ThreadingHTTPServer:
         else:
             _render(self, dash.snapshot(), as_json=False)
 
+    def _do_post(self):
+        import json as _json
+
+        path = self.path.split("?", 1)[0]
+        ln = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(ln)
+        try:
+            data = _json.loads(raw.decode("utf-8") or "{}") if isinstance(raw, bytes) and raw else {}
+        except Exception:
+            data = {}
+        if path == "/api/request":
+            r = dash.publish_request(str(data.get("text") or ""),
+                                     data.get("playbook_id"),
+                                     data.get("priority"))
+        elif path == "/api/decision":
+            r = dash.publish_decision(str(data.get("task_id") or ""),
+                                      str(data.get("approval_id") or ""),
+                                      str(data.get("decision") or ""))
+        elif path == "/api/snapshot":
+            r = {"published": True}
+        else:
+            r = {"published": False, "reason": "unknown endpoint"}
+            body = _json.dumps(r, ensure_ascii=False).encode("utf-8")
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        body = _json.dumps(r, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     server = ThreadingHTTPServer(
         (host, port),
         type("H", (BaseHTTPRequestHandler,), {
             "do_GET": _do_get,
+            "do_POST": _do_post,
             "log_message": lambda *a, **k: None,
         }),
     )
