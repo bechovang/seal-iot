@@ -14,7 +14,7 @@ Thông tin nằm trong file **`mqtt.env`** (đã bị gitignore → không bao g
 MQTT_HOST=mqtt-hackathon.lexatek.vn
 MQTT_PORT=443
 MQTT_USER=UNDERRATED
-MQTT_PASS=mq_t5YgMmdgtLcCneOIqPKsLQ
+MQTT_PASS=(xem mqtt.env — khong dua secret vao docs/git)
 MQTT_TOPIC=hackathon/underrated/test/telemetry
 ```
 
@@ -24,9 +24,9 @@ MQTT_TOPIC=hackathon/underrated/test/telemetry
 | **Port** | `443` | **MQTT-over-WebSocket (WSS)**, không phải TLS-TCP thường. |
 | **Transport** | WebSocket + TLS (`wss`) | Raw TLS-TCP sẽ *im lặng không kết nối*. |
 | **Username** | `UNDERRATED` | Phân biệt hoa thường. |
-| **Password** | `mq_t5YgMmdgtLcCneOIqPKsLQ` | |
+| **Password** | `(xem mqtt.env — secret khong vao git)` | |
 | **TEST Topic** | `hackathon/underrated/test/telemetry` | Kênh telemetry của team (giám khảo phát vào đây). |
-| **TEST Key** | `tk_RgL-biBExtbtaahv24d3rbJdnCmTiPO1` | Không dùng để kết nối paho; dùng cho cổng TEST của BTC (đánh dấu hành trình demo). |
+| **TEST Key** | `(xem mqtt.env — key da rot trong git history, nho xin BTC rotate)` | Không dùng để kết nối paho; dùng cho cổng TEST của BTC (đánh dấu hành trình demo). |
 
 > **Lưu ý quan trọng:** sau khi đổi host, `flags=websockets` + `tls` được tự nhận diện
 > trong `adapters/trackc.py` khi `port == 443`. Không cần đặt thêm gì.
@@ -43,7 +43,7 @@ import paho.mqtt.client as mqtt
 host = "mqtt-hackathon.lexatek.vn"
 port = 443
 user = "UNDERRATED"
-password = "mq_t5YgMmdgtLcCneOIqPKsLQ"
+password = "(xem mqtt.env — khong dua secret vao docs/git)"
 
 client = mqtt.Client(
     mqtt.CallbackAPIVersion.VERSION2,

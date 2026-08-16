@@ -337,3 +337,107 @@ def test_port_is_sole_tool_publisher():
     for _t, body in tool_msgs:
         assert body.get("schema_version") == TOOL_SCHEMA_VERSION
         assert body.get("tool") == "work_order"
+
+# ---------------------------------------------------------------------------
+# Fix-plan regressions (docs/PLAN-TRACKC-FIXES.md)
+# ---------------------------------------------------------------------------
+
+def _drive_with_auto_approval(sup, store, tid, timeout=8.0):
+    """Run advance + auto-approve parked stages until a terminal state (mirrors the
+    Epic 6 degraded drill, but drives manually so approvals are synchronous)."""
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = store.get(tid).state
+        if st in ("REPORTED", "PARTIAL", "FAILED", "CANCELLED"):
+            return store.get(tid).state
+        sup.advance(tid)
+        if store.get(tid).state == "AWAITING_APPROVAL":
+            apr = store.get(tid).approval_request_id
+            sup.handle_approval(tid, {"approval_id": apr, "decision": "APPROVED"})
+    raise AssertionError(f"task {tid} did not reach terminal (final {store.get(tid).state})")
+
+
+def test_p0_2_act_failure_replans_then_partials(monkeypatch):
+    """P0-2: a rejected/errored act (backend down) must not crash or stall; it replans
+    up to the back-edge cap, then lands PARTIAL (AD-3/AD-6)."""
+    _, bus, store, cmms, _, _, sup = build_fabric()
+
+    def _boom(*a, **k):
+        raise RuntimeError("cmms down")
+
+    monkeypatch.setattr(cmms, "create_work_order", _boom)
+    res = sup.ingest_request("prepare inspection", "prepare_inspection")
+    tid = res["task_id"]
+    assert _drive_with_auto_approval(sup, store, tid) == "PARTIAL"
+    # the failure became visible on the task trail, not swallowed
+    evs = [p for t, p in bus.messages if p.get("event") == "replan"]
+    assert evs, "act failure must publish a replan event"
+
+
+def test_p0_3_generic_request_observes_registry_and_falls_back_device():
+    """P0-3/P2: a generic request with no declared device still observes the whole
+    closed registry and the action falls back to a real observed device (AD-11).
+    Control flow alone reaches REPORTED with a work order."""
+    reg, _, store, cmms, _, _, sup = build_fabric()
+    res = sup.ingest_request("overall health check", "generic")
+    tid = res["task_id"]
+    assert _drive_with_auto_approval(sup, store, tid) == "REPORTED"
+    last = store.get(tid)
+    ev = json.loads(last.evidence_json) if isinstance(last.evidence_json, str) \
+        else (last.evidence_json or {})
+    obs = ev.get("observations", [])
+    assert obs, "generic observe must scan the whole registry, not nothing"
+    devs = {o.get("device_id") for o in obs}
+    assert devs and all(reg.device(d) is not None for d in devs), \
+        "all observed device ids must resolve in the registry (AD-11)"
+    assert cmms.lookup("work_orders"), "generic act must create a work order"
+
+
+def test_p0_1_request_autodrives_without_manual_advance():
+    """P0-1: the request-driven (judged) path auto-drives in the background — no caller
+    ever has to call advance() by hand — and still lands REPORTED."""
+    import time
+
+    _, _, store, cmms, _, _, sup = build_fabric()
+    res = sup.ingest_request("prepare inspection", "prepare_inspection",
+                             priority="URGENT", drive=True)
+    tid = res["task_id"]
+    deadline = time.time() + 6.0
+    while time.time() < deadline:
+        st = store.get(tid).state
+        if st == "AWAITING_APPROVAL":
+            apr = store.get(tid).approval_request_id
+            sup.handle_approval(tid, {"approval_id": apr, "decision": "APPROVED"})
+        elif st in ("REPORTED", "PARTIAL", "FAILED", "CANCELLED"):
+            break
+        time.sleep(0.05)
+    assert store.get(tid).state == "REPORTED"
+    assert cmms.lookup("reports"), "autodrive must create the manager report"
+
+
+def test_p2_priority_request_wins_playbook_default():
+    """P2: the request's explicit priority wins over the playbook default."""
+    _, _, store, _, _, _, sup = build_fabric()
+    r1 = sup.ingest_request("prepare inspection", "prepare_inspection", priority="URGENT")
+    assert store.get(r1["task_id"]).priority == "URGENT"
+    r2 = sup.ingest_request("prepare inspection", "prepare_inspection")
+    assert store.get(r2["task_id"]).priority == "ROUTINE"  # playbook default
+
+
+def test_p2_port_list_by_key_returns_recorded_artifact():
+    """P2: list_by_key returns the artifact recorded for a key (list-before-retry)."""
+    reg, _, _, cmms, port, _, _ = build_fabric()
+    r = port.create("work_order", {
+        "device_id": "motor_01", "summary": "x", "priority": "URGENT",
+        "idempotency_key": "claim-k",
+        "evidence": {"device": "motor_01", "signal": "motor_01_vib", "value": 1.0,
+                     "event_time": "", "age": None, "staleness": "fresh",
+                     "quality": "ok", "unit": "mm/s"},
+    })  # task_id omitted -> no state gate on the key-only round-trip
+    assert r.ok
+    lst = port.list_by_key("claim-k")
+    assert len(lst) == 1
+    assert lst[0]["kind"] == "work_order"
+    assert lst[0]["backend_id"] == r.backend_id

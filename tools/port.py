@@ -228,14 +228,14 @@ class ToolPort:
         return row[0] if row else ""
 
     def list_by_key(self, key: str) -> list[dict]:
-        """AD-6 list-before-retry: search the backend for existing artifacts for a key."""
-        entries = []
-        for kind in _KIND_TABLES:
-            backend_id = self._lookup_by_key(key)
-            if backend_id:
-                entries.append({"kind": kind, "backend_id": backend_id,
-                                "artifact": self._read_back(kind, backend_id)})
-        return entries
+        """AD-6 list-before-retry: find the recorded artifact(s) for a key."""
+        row = self._conn.execute(
+            "SELECT kind, backend_id FROM port_keys WHERE key=?", (key,)).fetchone()
+        if not row:
+            return []
+        kind, backend_id = row[0], row[1]
+        return [{"kind": kind, "backend_id": backend_id,
+                 "artifact": self._read_back(kind, backend_id)}]
 
     def lookup(self, kind: str) -> list[dict]:
         """Read-only lookups for agent context (maintenance_history, production_context)."""

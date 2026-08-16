@@ -12,7 +12,12 @@ class ActionAgent(BaseAgent):
 
     def deterministic(self, ctx: AgentContext) -> dict[str, Any]:
         evidence = ctx.observations and [o.to_evidence() for o in ctx.observations] or []
-        device = (ctx.device_ids() or [None])[0]
+        # generic playbook stages declare no device -> fall back to the first observed
+        # device (observer now scans the whole registry for generic requests), else None
+        # -> the port rejects that work order -> act fails -> replan (AD-6).
+        device = (ctx.device_ids()
+                  or [o.device_id for o in ctx.observations[:1]]
+                  or [None])[0]
         # Approval-marked act stage -> the port also creates an approval_request.
         intent = {
             "type": "work_order",

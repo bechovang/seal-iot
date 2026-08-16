@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 _LOCK = threading.RLock()
@@ -41,17 +42,37 @@ class HistoryBuffer:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_telemetry_ts ON telemetry (ts_epoch_ms)"
         )
+        # Local wall-clock arrival per signal (seconds). Event-time alone cannot see a
+        # STOPPED stream (AD-10); arrival-vs-now is the admitted wall-clock exception,
+        # same family as the approval TTL (AD-8). In-memory: a silence detector is a
+        # runtime concern, not history.
+        self._arrivals: dict[str, float] = {}
+
+    @property
+    def arrivals(self) -> dict[str, float]:
+        with _LOCK:
+            return dict(self._arrivals)
 
     # ---- write (ingest consumer only) ----
-    def write(self, signal_id: str, ts_epoch_ms: int, value: float, quality: str = "ok") -> None:
-        """Append a sample. Caller is responsible for row ordering per signal."""
+    def write(self, signal_id: str, ts_epoch_ms: int, value: float, quality: str = "ok",
+              arrival: float | None = None) -> None:
+        """Append a sample. Caller is responsible for row ordering per signal.
+        ``arrival`` overrides the recorded wall-clock arrival (tests simulate silence)."""
         with _LOCK:
             self._conn.execute(
                 "INSERT OR REPLACE INTO telemetry(signal_id, ts_epoch_ms, value, quality) "
                 "VALUES (?,?,?,?)",
                 (signal_id, ts_epoch_ms, value, quality),
             )
+            self._arrivals[signal_id] = arrival if arrival is not None else time.time()
             self._trim()
+
+    def last_arrival(self, signal_ids: list[str] | None = None) -> dict[str, float]:
+        """Wall-clock arrival seconds for the given signals (all when omitted)."""
+        with _LOCK:
+            if signal_ids is None:
+                return dict(self._arrivals)
+            return {s: self._arrivals[s] for s in signal_ids if s in self._arrivals}
 
     def _trim(self) -> None:
         # boundary = capacity across signals; keep the most recent N rows globally

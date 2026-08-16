@@ -189,3 +189,38 @@ def test_sim_covers_all_devices_deterministic():
     pc = a.tick(1, force_status={"motor_01": "error"})
     motor = next(d for d in pc["devices"] if d["deviceCode"] == "MOTOR_01")
     assert motor["status"] == "error"
+
+# ---------------------------------------------------------------------------
+# Fix-plan regressions (docs/PLAN-TRACKC-FIXES.md) — bridge P1 + scenario
+# ---------------------------------------------------------------------------
+
+def test_team_prefix_normalizes_full_and_raw_topics(monkeypatch, registry):
+    """P1: MQTT_TOPIC may hold the FULL topic people paste from the invite; the
+    settings must reduce it to the team prefix (hackathon/<team>/)."""
+    from adapters.trackc import _team_prefix, settings_from_env
+
+    assert _team_prefix("hackathon/underrated/test/telemetry") == "hackathon/underrated/"
+    assert _team_prefix("hackathon/underrated/judge/telemetry") == "hackathon/underrated/"
+    assert _team_prefix("hackathon/underrated/telemetry") == "hackathon/underrated/"
+    assert _team_prefix("hackathon/underrated") == "hackathon/underrated/"
+
+    # settings_from_env reads mqtt.env (real, gitignored) whose MQTT_TOPIC should
+    # be the full topic; assert the normalized prefix even when the env var is absent
+    monkeypatch.setenv("MQTT_TOPIC", "hackathon/underrated/test/telemetry")
+    cfg = settings_from_env(None)
+    assert cfg["topic_prefix"] == "hackathon/underrated/"
+
+
+def test_build_payload_scenario_is_optional_additive(registry):
+    """P1: scenario exists on the LIVE frame but not the written spec -> build_payload
+    keeps the exact 5-field contract by default and only adds scenario on request."""
+    from adapters.trackc import build_payload
+
+    p = build_payload({"motor_01": {"vibration": 1.0}}, "FACTORY", "UNDERRATED", 1784369401)
+    assert set(p) == {"timestamp", "epoch", "environment", "teamCode", "devices"}
+    assert "scenario" not in p
+
+    p2 = build_payload({"motor_01": {"vibration": 1.0}}, "FACTORY", "UNDERRATED",
+                       1784369401, scenario="NORMAL")
+    assert p2["scenario"] == "NORMAL"
+    assert p2["devices"][0]["deviceCode"] == "MOTOR_01"

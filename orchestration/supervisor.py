@@ -7,6 +7,7 @@ The auto loop spawns via ``spawn_from_incident`` (idempotent, priority-raises on
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Any, Callable
 
@@ -15,11 +16,6 @@ from .task_store import TaskStore, TERMINAL
 from .playbooks import Playbook, get_playbook, SEVERITY_PRIORITY, agent_for_stage
 from .agents.base import AgentContext, Observation
 from .agents import ROLE_CLASSES
-
-STAGE_FOR_AGENT = {
-    "observer": "observe", "maintenance": "plan", "production": "adjudicate",
-    "safety": "analyze", "action": "act", "supervisor": "report",
-}
 
 
 def _iso(epoch: float) -> str:
@@ -57,6 +53,7 @@ class Supervisor:
         self._llms: dict[str, Any] = {}
         self._agents: dict[str, Any] = {}
         self._subscribed = False
+        self._drive_lock = threading.RLock()   # 2 driver không đan xen trên 1 task
 
     # -- bus subscriptions ----------------------------------------------
     def subscribe(self, bus) -> None:
@@ -86,7 +83,7 @@ class Supervisor:
             # illegal playbook id from a request -> guard to generic (AD-3)
             pb = "generic"
         pb = pb or self._match_playbook(text)
-        self.ingest_request(text, pb, priority=priority)
+        self.ingest_request(text, pb, priority=priority, drive=True)
 
     # -- task creation (AD-1) -------------------------------------------
     def _match_playbook(self, text: str) -> str:
@@ -101,7 +98,11 @@ class Supervisor:
 
     def ingest_request(self, text: str, playbook_id: str = "generic",
                        source_incident_id: str | None = None,
-                       priority: str = "ROUTINE", origin: str = "human") -> dict:
+                       priority: str | None = None, origin: str = "human",
+                       drive: bool = False) -> dict:
+        """Mint a coordination task (sole entry for request-driven). ``drive=False``
+        by default keeps old test callers that ``advance()`` by hand unchanged; the
+        bus path and UI use ``drive=True`` so tasks actually run (AD-1)."""
         pb = get_playbook(playbook_id)
         if pb is None:
             raise ValueError(f"unknown playbook {playbook_id!r}")
@@ -111,21 +112,27 @@ class Supervisor:
         created = time.time()
         task = self.store.mint(playbook_id, text, origin=origin,
                                source_incident_id=source_incident_id,
-                               priority=pb.priority or priority, created=created)
+                               priority=priority or pb.priority or "ROUTINE", created=created)
         self._task_event(task.task_id, "opened",
                          {"task": task.to_dict(), "playbook": playbook_id})
+        if drive:
+            self._spawn_drive(task.task_id)
         return {"task_id": task.task_id, "state": task.state}
 
     def spawn_from_incident(self, incident_id: str, severity: str,
-                            playbook_id: str = "prepare_inspection") -> dict:
+                            playbook_id: str = "prepare_inspection",
+                            drive: bool = True) -> dict:
         """Auto-loop door (AD-1): idempotent spawn; a re-spawn may only raise priority.
-        Severity -> priority is a mandatory closed table, never silently defaulted."""
+        Severity -> priority is a mandatory closed table, never silently defaulted.
+        Auto-spawn drives the task in the background (``drive`` default True)."""
         if severity not in SEVERITY_PRIORITY:
             raise ValueError(f"incident severity {severity!r} has no mapped priority (AD-1)")
         priority = SEVERITY_PRIORITY[severity]
         live = self.store.live_pair(incident_id, playbook_id)
         if live is not None:
             raised = self.store.raise_priority_if_lower(live.task_id, priority)
+            if drive:
+                self._spawn_drive(live.task_id)
             return {"task_id": live.task_id, "state": live.state, "priority_raised": raised,
                     "minted": False}
         task = self.store.mint(playbook_id, f"auto from incident {incident_id}",
@@ -133,6 +140,8 @@ class Supervisor:
                                priority=priority)
         self._task_event(task.task_id, "opened",
                          {"auto": True, "source_incident_id": incident_id})
+        if drive:
+            self._spawn_drive(task.task_id)
         return {"task_id": task.task_id, "state": task.state, "minted": True,
                 "priority": task.priority}
 
@@ -183,7 +192,10 @@ class Supervisor:
                 state["observations"] = [o.to_dict() for o in observations]
                 self._save_evidence(task_id, state)
             if stage.name == "act":
-                self._apply_action(task_id, t, out)
+                applied = self._apply_action(task_id, t, out)
+                if applied.get("failed"):
+                    return self.replan_or_partial(
+                        task_id, "act", applied.get("reason") or "action_failed")
             stage_idx += 1
         if self.store.get(task_id).state == "REPORTED":
             return {"state": "REPORTED", "task_id": task_id}
@@ -217,22 +229,34 @@ class Supervisor:
                          {"stage": stage.name, "agent": agent_name, "output": out})
         return out
 
-    def _apply_action(self, task_id: str, task, out: dict) -> None:
+    def _apply_action(self, task_id: str, task, out: dict) -> dict:
         """After an approved act intent, the Tool port creates the informational
-        artifacts (work order + record + notification). Never ``cmd/*`` (AD-12)."""
+        artifacts (work order + record + notification). Never ``cmd/*`` (AD-12).
+        Returns {"ok": True, ...} or {"failed": True, "reason": ...} — a port
+        rejection FAILS the act stage so replan/PARTIAL can run (AD-3/AD-6)."""
         if self.port is None:
-            return
-        if out.get("type") == "work_order":
-            self.port.create("work_order", dict(out), task_id=task_id, stage_name="act",
-                             agent="action", priority=getattr(task, "priority", "ROUTINE"))
-        if getattr(task, "source_incident_id", None):
-            self.port.create("incident_record", {
-                "source_incident_id": task.source_incident_id, "note": out.get("summary", ""),
+            return {"ok": True, "skipped": "no_port"}
+        try:
+            if out.get("type") == "work_order":
+                r = self.port.create("work_order", dict(out), task_id=task_id, stage_name="act",
+                                     agent="action", priority=getattr(task, "priority", "ROUTINE"))
+                if not r.ok:
+                    return {"failed": True, "reason": f"work_order:{r.error}"}
+            if getattr(task, "source_incident_id", None):
+                r = self.port.create("incident_record", {
+                    "source_incident_id": task.source_incident_id, "note": out.get("summary", ""),
+                }, task_id=task_id, stage_name="act", agent="action")
+                if not r.ok:
+                    return {"failed": True, "reason": f"incident_record:{r.error}"}
+            r = self.port.create("notification", {
+                "recipient": "maintenance_manager",
+                "message": out.get("summary", "maintenance notification"),
             }, task_id=task_id, stage_name="act", agent="action")
-        self.port.create("notification", {
-            "recipient": "maintenance_manager",
-            "message": out.get("summary", "maintenance notification"),
-        }, task_id=task_id, stage_name="act", agent="action")
+            if not r.ok:
+                return {"failed": True, "reason": f"notification:{r.error}"}
+        except Exception as exc:  # noqa: BLE001 - a backend crash must read as act-fail
+            return {"failed": True, "reason": f"action_exception:{exc}"}
+        return {"ok": True}
 
     def _produce_report(self, task_id: str, task, observations) -> dict:
         """Supervisor-authored manager-condensed report (AD-12 / Reports): decision,
@@ -284,9 +308,37 @@ class Supervisor:
         self._agents[role] = obj
         return obj
 
+    # -- advance driver (AD-1) -------------------------------------------
+    def _drive(self, task_id: str) -> dict:
+        """Run advance() repeatedly while the task keeps making progress: a replan
+        returns mid-playbook (PLANNING) and must be driven again; approval waits and
+        terminal states exit. Guard: max 24 rounds + no-progress detection, so a
+        pathological task can never spin forever."""
+        with self._drive_lock:
+            out: dict = {}
+            for _ in range(24):
+                t0 = self.store.get(task_id)
+                snap = (t0.state, t0.stage_cursor) if t0 else None
+                out = self.advance(task_id)
+                t1 = self.store.get(task_id)
+                if out.get("state") in ("waiting", "REPORTED", "FAILED", "PARTIAL",
+                                        "CANCELLED", "unknown"):
+                    return out
+                snap1 = (t1.state, t1.stage_cursor) if t1 else None
+                if snap1 == snap:
+                    return out  # không tiến triển -> thoát chống treo
+            return out
+
+    def _spawn_drive(self, task_id: str) -> None:
+        threading.Thread(target=self._drive, args=(task_id,), daemon=True,
+                         name=f"drive-{task_id}").start()
+
     # -- approval (AD-8) -------------------------------------------------
     def _request_approval(self, task_id: str, task, pb: Playbook, stage, observations) -> dict:
-        device = stage.devices[0] if stage.devices else ""
+        # no declared device (generic) -> fall back to the first observed device, else
+        # the port rejects (surfaced as a FAILED closed) — consistent with action.
+        device = (stage.devices[0] if stage.devices
+                  else (observations[0].device_id if observations and observations[0].device_id else ""))
         evidence = [o.to_evidence() for o in observations]
         options = ["proceed", "cancel"]
         if stage.name == "adjudicate":
@@ -339,7 +391,7 @@ class Supervisor:
             self._save_evidence(task_id, st)
             self.store.transition(task_id, "approve")
             self._task_event(task_id, "approval_granted", {"approval_id": approval_id})
-            self.advance(task_id)
+            self._drive(task_id)   # drive tiếp (replan/act-fail -> chạy tới terminal)
             return {"accepted": True, "decision": decision}
         else:
             self.store.transition(task_id, "deny", fail_step="approval_denied")

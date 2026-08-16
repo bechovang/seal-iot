@@ -160,13 +160,6 @@ def get_playbook(playbook_id: str) -> Playbook | None:
     return PLAYBOOKS.get(playbook_id)
 
 
-def build_generic_playbook(stage_names: list[str]) -> Playbook:
-    """Compose a generic plan from the closed stage menu ONLY; any name outside the
-    menu is rejected by `Playbook.validate()`. Used by the supervisor fallback."""
-    stages = [PlaybookStage(name, agent_for_stage(name)) for name in stage_names]
-    return Playbook(id="generic", stages=stages, priority="ROUTINE")
-
-
 # stage_name -> default agent role (closed mapping).
 _AGENT_FOR_STAGE = {
     "observe": "observer", "analyze": "safety", "adjudicate": "production",

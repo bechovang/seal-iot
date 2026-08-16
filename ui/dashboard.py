@@ -156,9 +156,15 @@ class Dashboard:
         del rec["events"][:-128]
         if inner.get("stage_name"):
             rec["stage"] = inner["stage_name"]
-        st = inner.get("payload") if isinstance(inner.get("payload"), str) else None
-        rec["state"] = inner.get("agent") or rec["state"]
-        if inner.get("ts") and inner.get("event") in ("opened", "closed"):
+        p = inner.get("payload") if isinstance(inner.get("payload"), dict) else {}
+        task_info = p.get("task") if isinstance(p.get("task"), dict) else {}
+        ev = inner.get("event") or event
+        # state FSM thật: task dict có trong opened/handoff; closed mang {"state": ...}
+        if task_info.get("state"):
+            rec["state"] = task_info["state"]
+        elif ev == "closed" and p.get("state"):
+            rec["state"] = p["state"]
+        if inner.get("ts") and ev in ("opened", "closed"):
             rec["ts"] = inner["ts"]
         self._prune(self._tasks, cap=128)
 

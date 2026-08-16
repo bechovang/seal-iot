@@ -43,27 +43,39 @@ def test_dashboard_rejects_invalid_decision():
     assert [p for t, p in bus.messages if t.startswith("approval/")] == []
 
 
+def _poll_state(store, tid, target, timeout=5.0):
+    """Approvals are handled synchronously, but the request drive runs in a background
+    thread -> poll FSM state instead of asserting immediately (fast/robust)."""
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        s = store.get(tid).state
+        if s == target:
+            return store.get(tid)
+        time.sleep(0.05)
+    raise AssertionError(f"task {tid} not in {target} (final {store.get(tid).state})")
+
+
 def test_request_driven_path_end_to_end_runs_unchanged():
     """The judged path: dashboard request -> supervisor mints -> approvals -> REPORTED,
     with artifacts (work order + report) created via the Tool port."""
+    import time as _t
+
     _, bus, store, cmms, port, hist, sup, dash = make_dash()
     dash.publish_request("prepare inspection", "prepare_inspection", "URGENT")
     tasks = store.list_by()
     assert len(tasks) == 1   # exactly one task minted (idempotent)
     tid = tasks[0].task_id
-    assert tasks[0].state == "RECEIVED"
 
-    # gate until first approval (adjudicate)
-    sup.advance(tid)
-    t = store.get(tid)
-    assert t.state == "AWAITING_APPROVAL"
+    # gate until first approval (adjudicate) — request is auto-driven in background
+    t = _poll_state(store, tid, "AWAITING_APPROVAL")
     apr = t.approval_request_id
 
     # operator approves the adjudicate stage over the approval/<task_id> family
     dash.publish_decision(tid, apr, "APPROVED")   # supervisor auto-continues
-    t2 = store.get(tid)
-    assert t2.state == "AWAITING_APPROVAL"
-    assert t2.approval_request_id != apr
+    t2 = _poll_state(store, tid, "AWAITING_APPROVAL")
+    assert t2.approval_request_id != apr, "must move to a second approval (act)"
 
     dash.publish_decision(tid, t2.approval_request_id, "APPROVED")
     assert store.get(tid).state == "REPORTED"

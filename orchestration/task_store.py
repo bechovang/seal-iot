@@ -12,12 +12,27 @@ incident state.
 
 from __future__ import annotations
 
+import functools
+import threading
 import time
 import uuid
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+def _sync(fn):
+    """Serialize DB access on the per-store lock: the supervisor auto-drives tasks on
+    a background thread while the request/approval loop reads the same SQLite
+    connection on the main thread -> a bare connection is not safe across threads
+    (cursors interleave -> 'bad parameter or other API misuse'). RLock so nested
+    calls (e.g. ``transition`` -> ``get``) stay safe."""
+    @functools.wraps(fn)
+    def wrapper(self, *a, **k):
+        with self._lock:
+            return fn(self, *a, **k)
+    return wrapper
 
 # Priority closed set (AD-1/AD-7). Order == precedence.
 PRIORITIES = ("ROUTINE", "URGENT", "SAFETY")
@@ -104,6 +119,7 @@ class TaskStore:
                  ttl_seconds: float = 3600.0) -> None:
         self.db_path = str(db_path)
         self.ttl_seconds = ttl_seconds
+        self._lock = threading.RLock()
         if str(db_path) != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -140,6 +156,7 @@ class TaskStore:
     def _row_to_task(self, row) -> Task:
         return Task(*row)
 
+    @_sync
     def mint(self, playbook_id: str, request_text: str, origin: str = "human",
              source_incident_id: str | None = None, priority: str = "ROUTINE",
              created: float | None = None) -> Task:
@@ -164,6 +181,7 @@ class TaskStore:
         return self.get(task_id)
 
     # -- idempotent spawn (AD-1) ----------------------------------------
+    @_sync
     def live_pair(self, source_incident_id: str, playbook_id: str) -> Optional["Task"]:
         row = self._conn.execute(
             "SELECT * FROM tasks WHERE source_incident_id=? AND playbook_id=? "
@@ -172,6 +190,7 @@ class TaskStore:
         ).fetchone()
         return self._row_to_task(row) if row else None
 
+    @_sync
     def raise_priority_if_lower(self, task_id: str, priority: str) -> bool:
         """Re-spawn semantics: only ever *raise* (harden) a live pair's priority,
         never mint a duplicate. Returns True when raised."""
@@ -187,6 +206,7 @@ class TaskStore:
             return True
         return False
 
+    @_sync
     def get(self, task_id: str) -> Optional[Task]:
         row = self._conn.execute(
             "SELECT task_id,origin,request_text,source_incident_id,playbook_id,priority,state,"
@@ -195,6 +215,7 @@ class TaskStore:
         ).fetchone()
         return self._row_to_task(row) if row else None
 
+    @_sync
     def update_state(self, task_id: str, state: str, fail_step: str = "") -> Task:
         t = self.get(task_id)
         if t is None:
@@ -207,6 +228,7 @@ class TaskStore:
         self._conn.commit()
         return self.get(task_id)
 
+    @_sync
     def set_cursor(self, task_id: str, stage_cursor: str) -> Task:
         self._conn.execute(
             "UPDATE tasks SET stage_cursor=?, updated=? WHERE task_id=?",
@@ -215,6 +237,7 @@ class TaskStore:
         self._conn.commit()
         return self.get(task_id)
 
+    @_sync
     def set_approval(self, task_id: str, approval_request_id: str) -> Task:
         self._conn.execute(
             "UPDATE tasks SET approval_request_id=?, updated=? WHERE task_id=?",
@@ -223,6 +246,7 @@ class TaskStore:
         self._conn.commit()
         return self.get(task_id)
 
+    @_sync
     def set_evidence(self, task_id: str, evidence_json: str) -> Task:
         self._conn.execute(
             "UPDATE tasks SET evidence_json=?, updated=? WHERE task_id=?",
@@ -231,6 +255,7 @@ class TaskStore:
         self._conn.commit()
         return self.get(task_id)
 
+    @_sync
     def bump_replan(self, task_id: str) -> Task:
         t = self.get(task_id)
         if t is None:
@@ -243,6 +268,7 @@ class TaskStore:
         return self.get(task_id)
 
     # -- FSM transition (single table) ----------------------------------
+    @_sync
     def transition(self, task_id: str, event: str, fail_step: str = "") -> Task:
         t = self.get(task_id)
         if t is None:
@@ -253,6 +279,7 @@ class TaskStore:
         return self.update_state(task_id, to, fail_step)
 
     # -- resume / TTL ----------------------------------------------------
+    @_sync
     def resume_unfinished(self, now: float | None = None) -> list[Task]:
         now = now if now is not None else time.time()
         rows = self._conn.execute(
@@ -271,6 +298,7 @@ class TaskStore:
                 refreshed.append(t)
         return refreshed
 
+    @_sync
     def list_by(self, state: str | None = None) -> list[Task]:
         if state is None:
             rows = self._conn.execute("SELECT * FROM tasks ORDER BY created").fetchall()

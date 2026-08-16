@@ -45,6 +45,19 @@ def _normalize_metric(key: Any) -> str:
     return str(key or "").strip().lower()
 
 
+def _team_prefix(topic: str) -> str:
+    """Normalize whatever ``MQTT_TOPIC`` holds to the team topic PREFIX. People
+    naturally paste the full topic from the invite (``.../test/telemetry``); the
+    code needs ``hackathon/<team>/`` because subscribe uses ``<prefix>+/telemetry``
+    and publish builds ``<prefix><env>/telemetry``."""
+    t = str(topic or "").strip().strip("/")
+    for suffix in ("/test/telemetry", "/judge/telemetry", "/telemetry"):
+        if t.lower().endswith(suffix):
+            t = t[: -len(suffix)]
+            break
+    return f"{t}/" if t else ""
+
+
 def parse_payload(raw: dict, registry: TrackCRegistry) -> ParseResult:
     """Normalize one contract payload to canonical envelopes (AD-9/AD-10/AD-11).
 
@@ -73,10 +86,12 @@ def parse_payload(raw: dict, registry: TrackCRegistry) -> ParseResult:
         ts_str = raw.get("timestamp")
         if isinstance(ts_str, str) and ts_str:
             try:
-                from datetime import datetime
+                from datetime import datetime, timezone
 
                 dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                ts = dt.astimezone().__str__().replace("+00:00", "Z")
+                if dt.tzinfo is None:  # naive string -> read as UTC, never local
+                    dt = dt.replace(tzinfo=timezone.utc)
+                ts = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
             except ValueError:
                 res.skipped.append(("(message)", "unparseable timestamp"))
                 return res
@@ -129,10 +144,13 @@ def parse_payload(raw: dict, registry: TrackCRegistry) -> ParseResult:
 
 
 def build_payload(device_values: dict[str, dict[str, float]], environment: str,
-                  team_code: str, epoch: float, status: dict[str, str] | None = None) -> dict:
-    """Emit a payload that EXACTLY matches the immutable contract: five top-level
-    fields, correct nested shape, ``deviceCode`` uppercased. No added/removed/
-    re-nested fields (the organizer forbids changing the frame).
+                  team_code: str, epoch: float, status: dict[str, str] | None = None,
+                  scenario: str | None = None) -> dict:
+    """Emit a payload that EXACTLY matches the immutable contract: correct nested
+    shape, ``deviceCode`` uppercased. No added/removed/re-nested fields (the
+    organizer forbids changing the frame). ``scenario`` is included only when given —
+    the LIVE stream carries it ("NORMAL" observed 2026-08-16) while the written spec
+    the organizer shared omits it, so it stays optional here.
 
     ``device_values`` maps registry ``device_id`` -> {metric: value}. A device absent
     from ``status`` defaults to ``"ok"``.
@@ -144,13 +162,16 @@ def build_payload(device_values: dict[str, dict[str, float]], environment: str,
             "status": (status or {}).get(dev_id, "ok"),
             "metrics": {k: float(v) for k, v in metrics.items()},
         })
-    return {
+    frame: dict[str, Any] = {
         "timestamp": _iso_utc(epoch),
         "epoch": int(epoch),
         "environment": environment,
         "teamCode": team_code,
         "devices": devices,
     }
+    if scenario:
+        frame["scenario"] = scenario
+    return frame
 
 
 def settings_from_env(path: str | os.PathLike | None = None) -> dict[str, Any]:
@@ -183,7 +204,8 @@ def settings_from_env(path: str | os.PathLike | None = None) -> dict[str, Any]:
                          ("websockets" if port == 443 else "tcp"))
     cfg["ws_path"] = os.environ.get("MQTT_WS_PATH") or vals.get("MQTT_WS_PATH", "/mqtt")
     cfg["env"] = os.environ.get("MQTT_ENV") or vals.get("MQTT_ENV", cfg["env"])
-    cfg["topic_prefix"] = os.environ.get("MQTT_TOPIC") or vals.get("MQTT_TOPIC", cfg["topic_prefix"])
+    cfg["topic_prefix"] = _team_prefix(
+        os.environ.get("MQTT_TOPIC") or vals.get("MQTT_TOPIC", cfg["topic_prefix"]))
     cfg["team"] = os.environ.get("TRACKC_TEAM") or vals.get("TRACKC_TEAM", cfg["team"])
     cfg["environment"] = os.environ.get("TRACKC_ENVIRONMENT") or vals.get("TRACKC_ENVIRONMENT", cfg["environment"])
     return cfg
@@ -235,14 +257,33 @@ class TrackCBridge:
 
     def start(self, bus) -> None:
         """Start the internal-bus re-publisher. ``bus`` is a ``BusClient`` (or the
-        InMemoryBus-driven client). Listens on the team's test+judge topics; each
-        incoming contract payload is normalized and re-published on ``tele/*``."""
+        InMemoryBus-driven client). Subscribes to the team's test+judge telemetry
+        topics; each incoming contract payload is normalized and re-published on
+        ``tele/*``. Offline/test harnesses drive :meth:`ingest_payload` directly."""
         self._bus = bus
         if self.connected:
-            import threading
+            self._client.on_message = self._on_message
+            self._client.on_connect = self._on_connect
             self._client.subscribe(f"{self.settings['topic_prefix']}+/telemetry")
-            self._client.on_message = lambda *a: None  # handler wired via ingest below
-        # In offline/test we drive ingest_payload() directly; no broker needed.
+
+    def _on_connect(self, client, userdata, flags, rc, properties=None) -> None:
+        # paho drops subscriptions across reconnects — re-arm on every (re)connect.
+        client.subscribe(f"{self.settings['topic_prefix']}+/telemetry")
+
+    def _on_message(self, client, userdata, msg) -> None:
+        """paho callback: one broker frame -> canonical envelopes on the internal
+        bus. A malformed frame is skipped, never raised — the broker loop must
+        survive bad input (AD-9 quarantine)."""
+        try:
+            raw = json.loads(msg.payload.decode("utf-8", "replace"))
+        except ValueError:
+            return
+        if not isinstance(raw, dict):
+            return
+        try:
+            self.ingest_payload(raw)
+        except Exception:  # noqa: BLE001
+            pass
 
     def ingest_payload(self, raw: dict) -> ParseResult:
         """Normalize a contract payload and (if a bus is bound) publish the canonical

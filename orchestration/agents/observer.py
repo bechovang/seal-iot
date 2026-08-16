@@ -6,6 +6,7 @@ dropped and never filled with invented values."""
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from .base import BaseAgent, AgentContext, Observation
@@ -16,6 +17,10 @@ class ObserverAgent(BaseAgent):
 
     def deterministic(self, ctx: AgentContext) -> dict[str, Any]:
         device_ids = list(ctx.device_ids())
+        if not device_ids:
+            # generic playbook declares no devices -> observe the whole closed
+            # registry (AD-11) instead of seeing nothing
+            device_ids = list(ctx.registry.devices)
         # Scenario 1: expand to related devices when the stage asks for them.
         if getattr(ctx.stage, "inputs", {}).get("related"):
             for did in list(device_ids):
@@ -58,7 +63,8 @@ class ObserverAgent(BaseAgent):
                         ref_ts: int) -> Observation:
         rows = ctx.history.recent([signal_id], limit=3) if ctx.history is not None else []
         unit = ctx.registry.signal_unit(signal_id)
-        dev_id = signal_id.rsplit("_", 1)[0]
+        dev = ctx.registry.device_for_signal(signal_id)  # registry-owned identity (AD-11)
+        dev_id = dev.device_id if dev else signal_id.rsplit("_", 1)[0]
         if not rows:
             return Observation(device_id=dev_id, signal_id=signal_id, value=None,
                                event_ts="", age_seconds=None, staleness="offline",
@@ -74,6 +80,17 @@ class ObserverAgent(BaseAgent):
             "+00:00", "Z")
         age = None if ref_ts <= 0 else max(0, (ref_ts - ts) / 1000.0)
         staleness = _staleness(age, ctx.runtime)
+        if quality in ("offline", "error"):
+            # ingest truth (AD-10): the source SAID the device is offline/error —
+            # no age computation may downgrade that
+            staleness = quality
+        elif hasattr(ctx.history, "last_arrival"):
+            # stopped-stream: event-time stays fresh forever when a device hangs;
+            # arrival-vs-now is the admitted wall-clock exception (see buffer.py)
+            arrivals = ctx.history.last_arrival([signal_id])
+            if signal_id in arrivals:
+                arrival_age = max(0.0, time.time() - arrivals[signal_id])
+                staleness = _worst(staleness, _staleness(arrival_age, ctx.runtime))
         return Observation(
             device_id=dev_id, signal_id=signal_id,
             value=value, event_ts=event_ts, age_seconds=age, staleness=staleness,
@@ -91,11 +108,21 @@ def _staleness(age: float | None, runtime) -> str:
     return "fresh"
 
 
+_STALE_ORDER = {"fresh": 0, "stale": 1, "critical_stale": 2, "missing_age": 2,
+                "error": 3, "offline": 3, "missing_ts": 3}
+
+
+def _worst(a: str, b: str) -> str:
+    return a if _STALE_ORDER.get(a, 0) >= _STALE_ORDER.get(b, 0) else b
+
+
 def _finding(obs: list[Observation]) -> str:
-    stale = [o for o in obs if o.staleness in ("stale", "critical_stale", "offline", "missing_ts")]
+    stale = [o for o in obs if o.staleness in
+             ("stale", "critical_stale", "offline", "error", "missing_ts")]
     if not obs:
         return "no device telemetry available for inspection"
     if not stale:
         return f"observed {len(obs)} signal(s); all fresh"
     names = ", ".join(o.signal_id for o in stale[:5])
-    return f"{len(stale)} stale/offline signal(s): {names} — plan must assume degraded telemetry"
+    return (f"{len(stale)} stale/offline/error signal(s): {names} — "
+            f"plan must assume degraded telemetry")
