@@ -250,10 +250,14 @@ class TrackCBridge:
             client.ws_set_options(path=self.settings.get("ws_path", "/mqtt"))
         elif self.settings.get("tls"):
             client.tls_set()
-        client.connect(host, int(self.settings.get("port", 1883)), keepalive=30)
-        client.loop_start()
+        # callbacks BEFORE connect()/loop_start(): the CONNACK (and thus _on_connect
+        # -> subscribe + heartbeat) can be processed by the network thread the moment
+        # loop_start() runs — assigning after would race and silently drop it.
         client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
+        client.on_message = self._on_message
+        client.connect(host, int(self.settings.get("port", 1883)), keepalive=30)
+        client.loop_start()
         self._client = client
         self.connected = True
         return True
@@ -264,9 +268,13 @@ class TrackCBridge:
         topics; each incoming contract payload is normalized and re-published on
         ``tele/*``. Offline/test harnesses drive :meth:`ingest_payload` directly."""
         self._bus = bus
-        if self.connected:
+        # on_message whenever a client exists (start() may run BEFORE connect());
+        # _on_connect re-subscribes on every (re)connect, so subscribe here only
+        # as an eager arm for the already-connected case.
+        if self._client is not None:
             self._client.on_message = self._on_message
-            self._client.subscribe(f"{self.settings['topic_prefix']}+/telemetry")
+            if self.connected:
+                self._client.subscribe(f"{self.settings['topic_prefix']}+/telemetry")
 
     def _on_connect(self, client, userdata, flags, rc, properties=None) -> None:
         # paho drops subscriptions across reconnects — re-arm on every (re)connect.
