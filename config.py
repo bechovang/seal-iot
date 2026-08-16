@@ -102,6 +102,7 @@ class Mapping:
         broker_port: int = 1883,
         topology: Topology | None = None,
         commands: list[Command] | None = None,
+        trackc: TrackCRegistry | None = None,
     ) -> None:
         self.dataset = dataset
         self.rate_hz = rate_hz
@@ -112,6 +113,7 @@ class Mapping:
         self.broker_port = broker_port
         self.topology = topology or Topology()
         self.commands = commands or []
+        self.trackc = trackc  # None when the HAI flow has no Track C section (AD-9)
         self._by_id = {c.signal_id: c for c in columns}
 
     @property
@@ -173,6 +175,7 @@ def load_mapping(path: Path | None = None) -> Mapping:
         broker_port=int(cfg.get("broker", {}).get("port", 1883)),
         topology=_parse_topology(cfg.get("topology", {})),
         commands=[Command.from_dict(c) for c in cfg.get("commands", [])],
+        trackc=_load_trackc(cfg.get("trackc")) if cfg.get("trackc") else None,
     )
     errs = m.validate()
     if errs:
@@ -180,11 +183,139 @@ def load_mapping(path: Path | None = None) -> Mapping:
     return m
 
 
+def _load_trackc(cfg: dict) -> TrackCRegistry:
+    """Build + validate the closed device registry (AD-11). Invalid registry = a
+    hard config error, matching how the rest of mapping.yaml fails."""
+    reg = TrackCRegistry.from_config(cfg)
+    errs = reg.validate()
+    if errs:
+        raise ValueError("mapping.yaml trackc: invalid: " + "; ".join(errs))
+    return reg
+
+
 def _parse_topology(t: dict) -> Topology:
     return Topology(
         assets=dict(t.get("assets", {}) or {}),
         connections=list(t.get("connections", []) or []),
     )
+
+
+@dataclass
+class TrackCSignal:
+    """One measurable metric of a Track C device (metric + engineering unit)."""
+
+    metric: str
+    unit: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TrackCSignal":
+        return cls(metric=d["metric"], unit=d.get("unit", ""))
+
+
+@dataclass
+class TrackCDevice:
+    """A Track C device. ``device_id`` is lowercase snake; aggregate devices (line/area)
+    declare ``members`` and zero signals of their own. ``relates`` = adjacency heuristic.
+    """
+
+    device_id: str
+    name: str
+    signals: list[TrackCSignal] = field(default_factory=list)
+    members: list[str] = field(default_factory=list)
+    relates: list[str] = field(default_factory=list)
+
+    @property
+    def signal_ids(self) -> list[str]:
+        """signal_id = <device_id>_<metric> (AD-11 canonical identity)."""
+        return [f"{self.device_id}_{sig.metric}" for sig in self.signals]
+
+    @property
+    def is_aggregate(self) -> bool:
+        return bool(self.members) and not self.signals
+
+    @classmethod
+    def from_dict(cls, device_id: str, d: dict) -> "TrackCDevice":
+        return cls(
+            device_id=device_id,
+            name=d.get("name", device_id),
+            signals=[TrackCSignal.from_dict(s) for s in d.get("signals", [])],
+            members=list(d.get("members", []) or []),
+            relates=list(d.get("relates", []) or []),
+        )
+
+
+class TrackCRegistry:
+    """Closed canonical device registry (AD-11): the ONLY set of valid device ids /
+    signal ids. Locks, staleness reports, idempotency keys and work-order fields must
+    use registry ids — anything else is rejected by code."""
+
+    def __init__(self, devices: dict[str, TrackCDevice] | None = None,
+                 topic_prefix: str = "") -> None:
+        self.devices: dict[str, TrackCDevice] = devices or {}
+        self.topic_prefix = topic_prefix
+
+    # -- accessors -----------------------------------------------------------
+    def device(self, device_id: str) -> TrackCDevice | None:
+        return self.devices.get(device_id)
+
+    def device_for_signal(self, signal_id: str) -> TrackCDevice | None:
+        for dev in self.devices.values():
+            if signal_id in dev.signal_ids:
+                return dev
+        return None
+
+    def related(self, device_id: str) -> list[str]:
+        """Devices adjacent to ``device_id`` (scenario-1 "related devices"). A device
+        is related if it appears in the device's ``relates`` or vice-versa."""
+        dev = self.devices.get(device_id)
+        out = set((dev.relates if dev else []) or [])
+        for other in self.devices.values():
+            if device_id in (other.relates or []):
+                out.add(other.device_id)
+        return sorted(out)
+
+    def all_signal_ids(self) -> list[str]:
+        ids: list[str] = []
+        for dev in self.devices.values():
+            ids.extend(dev.signal_ids)
+        return ids
+
+    def signal_unit(self, signal_id: str) -> str:
+        dev = self.device_for_signal(signal_id)
+        if dev is None:
+            return ""
+        for sig in dev.signals:
+            if f"{dev.device_id}_{sig.metric}" == signal_id:
+                return sig.unit
+        return ""
+
+    # -- validation ----------------------------------------------------------
+    def validate(self) -> list[str]:
+        """Fail-fast: device id shape; duplicate metric within a device; relates/members
+        pointing at unknown devices; a plain device with zero signals."""
+        import re
+
+        errors: list[str] = []
+        pat = re.compile(r"^[a-z0-9_]+$")
+        for did, dev in self.devices.items():
+            if not pat.match(did):
+                errors.append(f"device id {did!r} not matching ^[a-z0-9_]+$")
+            metrics = [s.metric for s in dev.signals]
+            if len(metrics) != len(set(metrics)):
+                errors.append(f"device {did}: duplicate metric")
+            for ref in (*dev.relates, *dev.members):
+                if ref not in self.devices:
+                    errors.append(f"device {did} references unknown device {ref!r}")
+            if not dev.members and not dev.signals:
+                errors.append(f"device {did}: no signals and not an aggregate")
+        return errors
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> "TrackCRegistry":
+        return cls(
+            devices={did: TrackCDevice.from_dict(did, d) for did, d in cfg.get("devices", {}).items()},
+            topic_prefix=cfg.get("topic_prefix", ""),
+        )
 
 
 @dataclass
@@ -258,6 +389,29 @@ class VariantConfig:
 
 
 @dataclass
+class TrackCRuntimeConfig:
+    """Runtime knobs for Track C (AD-9): staleness thresholds, per-role LLM budget,
+    wait TTLs, severity->priority table. Source knowledge (device registry, units,
+    relations, production-context seed) lives in mapping.yaml `trackc:` — NOT here."""
+    stale_seconds: float = 30.0        # value older than this -> stale (AD-10)
+    critical_seconds: float = 120.0    # older still -> critical stale
+    approve_ttl_seconds: float = 300.0  # wall-clock bounded human wait (AD-8)
+    clarify_ttl_seconds: float = 600.0
+    llm_budgets: dict = field(default_factory=lambda: {
+        "supervisor": 3, "observer": 3, "maintenance": 3,
+        "production": 3, "safety": 3, "action": 3,
+    })
+    replay_path: str = ""
+    mode: str = "live"  # live | replay (AD-13)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TrackCRuntimeConfig":
+        allowed = {f.name for f in cls.__dataclass_fields__.values()}
+        kw = {k: v for k, v in data.items() if k in allowed}
+        return cls(**kw)
+
+
+@dataclass
 class DemoConfig:
     ui_dir: str = "ui"
     tts_clips_dir: str = "ui/tts_clips"
@@ -280,6 +434,7 @@ class HarnessConfig:
     incident: IncidentConfig = field(default_factory=IncidentConfig)
     variant: VariantConfig = field(default_factory=VariantConfig)
     demo: DemoConfig = field(default_factory=DemoConfig)
+    trackc: TrackCRuntimeConfig = field(default_factory=TrackCRuntimeConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "HarnessConfig":
@@ -299,6 +454,7 @@ class HarnessConfig:
             incident=_as(IncidentConfig, cfg.get("incident", {})),
             variant=_as(VariantConfig, cfg.get("variant", {})),
             demo=_as(DemoConfig, cfg.get("demo", {})),
+            trackc=TrackCRuntimeConfig.from_dict(cfg.get("trackc", {})),
         )
 
 

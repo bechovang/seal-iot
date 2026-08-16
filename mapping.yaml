@@ -40,3 +40,35 @@ label_columns:
   - attack_P1
   - attack_P2
   - attack_P3
+
+# ─── Track C stream (spine 2026-08-16: AD-9/AD-11) ───
+# Registry thiết bị CHUẨN — device_id lowercase snake; signal_id = <device_id>_<metric>.
+# relations = adjacency heuristic cho "thiết bị liên quan" (Kịch bản 1).
+# Payload schema broker đến từ spec BTC (contract bất biến) — chỉ adapters/trackc.py đụng vào.
+trackc:
+  topic_prefix: "hackathon/underrated/"
+  devices:
+    motor_01:
+      name: "Động cơ băng chuyền 1"
+      signals: [{metric: current, unit: 'A'}, {metric: vibration, unit: 'mm/s'}, {metric: temperature, unit: '°C'}]
+      relates: [conveyor_01, line_01]
+    conveyor_01:
+      name: "Băng chuyền 1"
+      signals: [{metric: speed, unit: 'm/s'}, {metric: load, unit: 'kg'}]
+      relates: [motor_01]
+    line_01:
+      name: "Đường dây chính"
+      signals: [{metric: voltage, unit: 'V'}, {metric: current, unit: 'A'}]
+      relates: [motor_01]
+    press_01:
+      name: "Cảm biến áp suất lò"
+      signals: [{metric: pressure, unit: 'bar'}]
+      relates: [probe_01]
+    probe_01:
+      name: "Đầu dò nhiệt lò"
+      signals: [{metric: temperature, unit: '°C'}]
+      relates: [press_01, gas_01]
+    gas_01:
+      name: "Cảm biến khí xưởng"
+      signals: [{metric: gas, unit: 'ppm'}]
+      relates: [press_01, probe_01]
