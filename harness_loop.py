@@ -232,6 +232,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="explicit playbook id for --trackc (default: auto-match)")
     ap.add_argument("--trackc-approve", default="all", choices=["all", "first", "deny", "none"],
                     help="approval decisions to make during --trackc")
+    ap.add_argument("--trackc-live", action="store_true",
+                    help="control room VIEW-ONLY trên MQTT LIVE: bridge + auto-loop "
+                         "detector + approval autopilot; không thao tác gì")
+    ap.add_argument("--approval-policy", default="auto",
+                    choices=["auto", "human", "deny-first"],
+                    help="policy cổng phê duyệt trong --trackc-live (default auto)")
+    ap.add_argument("--approval-delay", type=float, default=4.0,
+                    help="giây chờ trước khi autopilot phát quyết định (cho TTL hiện)")
     args = ap.parse_args(argv)
 
     harness = HarnessConfig.load()
@@ -249,18 +257,90 @@ def main(argv: list[str] | None = None) -> int:
 
     # AD-14: watch mode doubles as the control-room console — the dashboard server is
     # started with --serve-ui <port> or automatically (default 8765) under --watch.
-    if args.serve_ui or args.watch:
+    # Track C live also needs the dashboard (view-model + autopilot feed).
+    if args.serve_ui or args.watch or args.trackc_live:
         from ui import Dashboard, serve
 
-        dash = Dashboard()
+        dash = Dashboard(thresholds={
+            "stale_seconds": harness.trackc.stale_seconds,
+            "critical_seconds": harness.trackc.critical_seconds,
+            "approve_ttl_seconds": harness.trackc.approve_ttl_seconds,
+            "clarify_ttl_seconds": harness.trackc.clarify_ttl_seconds,
+        }) if harness.trackc else Dashboard()
         bus.subscribe("", dash.handler)
-        port = args.serve_ui or (8765 if args.watch else 8766)
-        srv = serve(dash, "127.0.0.1", port)
+        ui_port = args.serve_ui or (8765 if args.watch else 8766)
+        srv = serve(dash, "127.0.0.1", ui_port)
         import threading as _th
 
         _th.Thread(target=srv.serve_forever, daemon=True).start()
-        print(f"control-room on http://127.0.0.1:{port}" if args.watch
-              else f"dashboard on http://127.0.0.1:{port}")
+        print(f"control-room on http://127.0.0.1:{ui_port}" if args.watch
+              else f"dashboard on http://127.0.0.1:{ui_port}")
+
+    if args.trackc_live:
+        # Chế độ chấm VIEW-ONLY: bridge MQTT live + auto-loop detector + approval
+        # autopilot + control room. Không ai thao tác — hệ tự chạy.
+        from config import load_mapping as _lm
+        from history import HistoryBuffer
+        from orchestration import TaskStore, Supervisor
+        from orchestration.auto_loop import AutoLoopDetector, ApprovalAutopilot
+        from tools import CMMSSim, ToolPort
+        from adapters.trackc import TrackCBridge, settings_from_env
+        import time as _lc_t
+
+        def _iso_epoch_ms(iso_s):
+            from datetime import datetime, timezone
+
+            return int(datetime.fromisoformat(iso_s.replace("Z", "+00:00"))
+                       .timestamp() * 1000)
+
+        def _hist_ingest(topic, payload):
+            # tele/* trên bus (TelemetryEnvelope) -> HistoryBuffer (detector đọc hist,
+            # KHÔNG đọc bus trực tiếp — nếu không detector mù, xem mục 2.4).
+            sig = payload.get("signal_id") or topic.rsplit("/", 1)[-1]
+            try:
+                _hist.write(sig, _iso_epoch_ms(payload.get("ts") or ""),
+                            float(payload.get("value") or 0),
+                            payload.get("quality", "ok"))
+            except Exception:  # noqa: BLE001
+                pass
+
+        _reg = _lm().trackc
+        _rt = harness.trackc
+        _store = TaskStore("orchestration/tasks.db")
+        _cmms = CMMSSim("tools/cmms.db")
+        _port = ToolPort(_cmms, _reg,
+                         lambda tid: _store.get(tid).state if tid else None,
+                         db_path="tools/port_keys.db", bus=bus)
+        _hist = HistoryBuffer("demo/trackc_history.db")
+        bus.subscribe("tele/", _hist_ingest)
+        _sup = Supervisor(_store, _reg, _rt, bus=bus, port=_port, history=_hist,
+                          cmms=_cmms, mode="live")
+        _sup.subscribe(bus)
+        dash.set_publisher(bus)
+        dash.set_policy(args.approval_policy, args.approval_delay)
+
+        _br = TrackCBridge(_reg, settings_from_env())
+        _br.start(bus)                            # bind bus TRƯỚC connect để chip có bus
+        if not _br.connect():
+            print("MQTT bridge: KHÔNG kết nối được broker — kiểm tra mqtt.env "
+                  "(UI vẫn chạy, chip sẽ đỏ)")
+        detector = AutoLoopDetector(_sup, _reg, _hist, bus=bus,
+                                    stale_seconds=_rt.stale_seconds,
+                                    critical_seconds=_rt.critical_seconds)
+        autopilot = ApprovalAutopilot(dash, policy=args.approval_policy,
+                                      delay=args.approval_delay)
+        detector.start()
+        autopilot.start()
+        print(f"trackc-live: policy={args.approval_policy} delay={args.approval_delay}s "
+              f"— control room: http://127.0.0.1:{ui_port} — Ctrl-C để dừng")
+        try:
+            while True:
+                _lc_t.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        _br.close()
+        recorder.close()
+        return 0
 
     if args.trackc:
         # Track C (AD-1..8/12): run ONE request-driven coordination task over the same

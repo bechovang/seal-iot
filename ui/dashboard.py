@@ -56,7 +56,17 @@ class Dashboard:
     fsm, learn, counters) power the control-room SPA.
     """
 
-    def __init__(self, max_events: int = 200, series_points: int = 240) -> None:
+    def __init__(self, max_events: int = 200, series_points: int = 240,
+                 thresholds: dict | None = None) -> None:
+        # Track C runtime thresholds (AD-10): pushed to the SPA so the staleness bars
+        # and approval TTL countdown match what the supervisor actually enforces.
+        thr = thresholds or {}
+        self._thresholds = {
+            "stale_seconds": float(thr.get("stale_seconds", 30.0)),
+            "critical_seconds": float(thr.get("critical_seconds", 120.0)),
+            "approve_ttl_seconds": float(thr.get("approve_ttl_seconds", 300.0)),
+            "clarify_ttl_seconds": float(thr.get("clarify_ttl_seconds", 600.0)),
+        }
         self._lock = threading.Lock()
         self._events: list[dict[str, Any]] = []  # ring: ops/* and cmd/* only
         self.max_events = max_events
@@ -80,6 +90,12 @@ class Dashboard:
         # approval/<task_id>; it also aggregates task/* it consumes from the supervisor.
         self._pub = None        # set_publisher(busPublishable)
         self._tasks: "OrderedDict[str, dict]" = OrderedDict()
+        self._tools: "OrderedDict[str, dict]" = OrderedDict()   # AD-6 tool port audit
+        self._bridge = {"connected": False, "since": "", "last_seen": None}
+        self._incfeed: list[dict] = []          # auto_incident feed (FE-1)
+        self._policy = {"mode": "human", "delay_s": 0.0}
+        self._last_tele_at = time.time()
+        self._last_tele_ts_ms: int | None = None
 
     # -- normalization -------------------------------------------------------
     @staticmethod
@@ -97,15 +113,27 @@ class Dashboard:
 
     # -- routing -------------------------------------------------------------
     def handler(self, topic: str, payload: dict) -> None:
-        inner = self._normalize(payload)
+        # task/tool/bridge envelopes keep their TOP-LEVEL fields (event/agent/stage_name/
+        # ts/payload), so pass the RAW envelope to those ingress paths — _normalize would
+        # strip them and lose approval_id/options/evidence (BE-4). tele/op unwrap as before.
         if topic.startswith("tele/"):
+            inner = self._normalize(payload) or payload
             with self._lock:
                 self._ingest_tele(topic, inner)
             return
         if topic.startswith("task/"):
             with self._lock:
-                self._ingest_task(topic, inner)
+                self._ingest_task(topic, payload)
             return
+        if topic.startswith("tool/"):
+            with self._lock:
+                self._ingest_tool(topic, payload)
+            return
+        if topic.startswith("bridge/"):
+            with self._lock:
+                self._ingest_bridge(topic, payload)
+            return
+        inner = self._normalize(payload) or payload
         with self._lock:
             self._ingest_op(topic, payload, inner)
 
@@ -113,6 +141,10 @@ class Dashboard:
     def set_publisher(self, pub) -> None:
         """Attach a bus-publishable (InMemoryBus, or a transport the harness wires)."""
         self._pub = pub
+
+    def set_policy(self, mode: str, delay_s: float) -> None:
+        """Approval policy hiển thị lên UI (FE-2): 'auto' demo / 'human' production."""
+        self._policy = {"mode": mode, "delay_s": delay_s}
 
     def publish_request(self, text: str, playbook_id: str | None = None,
                         priority: str | None = None, in_reply_to: str | None = None) -> dict:
@@ -145,28 +177,99 @@ class Dashboard:
         self._pub.publish(approval_topic(task_id), payload, qos=1)
         return {"published": True}
 
-    def _ingest_task(self, topic: str, inner: dict) -> None:
-        """Aggregate task/* frames into a per-task control card the SPA can render."""
+    def _ingest_task(self, topic: str, env: dict) -> None:
+        """Aggregate task/* frames (the raw envelope) into a per-task control card.
+        This is what the SPA renders for the FSM stepper + approval console + replan
+        badge + PARTIAL reason (BE-4). Input is the TaskEvent envelope (its ``payload``
+        is the inner event payload with task dict / output / approval_id)."""
         parts = topic.split("/")
         task_id = parts[1] if len(parts) > 1 else ""
         event = parts[-1]
+        ev = env.get("event") or event
         rec = self._tasks.setdefault(task_id, {"task_id": task_id, "events": [],
-                                                "stage": "", "state": "", "ts": ""})
-        rec["events"].append(inner.get("event") or event)
-        del rec["events"][:-128]
-        if inner.get("stage_name"):
-            rec["stage"] = inner["stage_name"]
-        p = inner.get("payload") if isinstance(inner.get("payload"), dict) else {}
+                                                "stage": "", "state": "", "ts": "",
+                                                "agent": "", "approval": None,
+                                                "replans": 0, "fail_reason": "",
+                                                "finding": "", "report": "",
+                                                "stage_outputs": []})
+        rec["events"].append(ev)
+        del rec["events"][:-256]
+        if env.get("stage_name"):
+            rec["stage"] = env["stage_name"]
+        if env.get("agent"):
+            rec["agent"] = env["agent"]
+        p = env.get("payload") if isinstance(env.get("payload"), dict) else {}
         task_info = p.get("task") if isinstance(p.get("task"), dict) else {}
-        ev = inner.get("event") or event
-        # state FSM thật: task dict có trong opened/handoff; closed mang {"state": ...}
-        if task_info.get("state"):
-            rec["state"] = task_info["state"]
-        elif ev == "closed" and p.get("state"):
-            rec["state"] = p["state"]
-        if inner.get("ts") and ev in ("opened", "closed"):
-            rec["ts"] = inner["ts"]
+        # FSM state: task dict (opened/handoff) hoặc field "state" do event mang theo
+        # (approval_requested mang AWAITING_APPROVAL, closed mang terminal state)
+        st = task_info.get("state") or p.get("state")
+        rec["state"] = st if st else rec.get("state", "")
+        if ev == "closed" and st == "PARTIAL":
+            rec["fail_reason"] = p.get("fail") or p.get("reason") or ""
+        if env.get("ts"):
+            rec["ts"] = env["ts"]
+        # approval_granted: store là EXECUTING nhưng event không mang task dict — set rõ
+        if ev == "approval_granted":
+            rec["state"] = "EXECUTING"
+            rec["approval"] = None
+        # approval card (AD-8): capture approval_id+options so the SPA can POST /api/decision
+        if ev == "approval_requested":
+            rec["approval"] = {
+                "approval_id": p.get("approval_id", ""),
+                "options": p.get("options", []),
+                "stage": rec["stage"] or p.get("stage", ""),
+                "device": p.get("device", ""),
+                "ts": env.get("ts", ""),
+            }
+        elif ev in ("approval_granted", "approval_denied"):
+            rec["approval"] = None
+        # replan loop (AD-3): badge + last failed_stage
+        if ev == "replan":
+            rec["replans"] = rec.get("replans", 0) + 1
+            rec["replan_stage"] = p.get("failed_stage", "")
+            rec["replan_target"] = p.get("target", "")
+            rec["replan_reason"] = p.get("reason", "")
+            rec["replan_attempts"] = p.get("attempts", rec.get("replans", 0))
+        # stage_done output: finding (observe) / report (report)
+        out = p.get("output") if isinstance(p.get("output"), dict) else {}
+        if ev == "stage_done" and rec["stage"] == "observe" and out.get("finding"):
+            rec["finding"] = out["finding"]
+        if ev == "stage_done" and rec["stage"] == "report" and out.get("summary"):
+            rec["report"] = out["summary"]
+        if env.get("stage_name"):
+            rec["stage_outputs"].append({"stage": env["stage_name"],
+                                           "agent": env.get("agent", ""),
+                                           "ts": env.get("ts", "")})
+            del rec["stage_outputs"][:-64]
         self._prune(self._tasks, cap=128)
+
+    def _ingest_tool(self, topic: str, env: dict) -> None:
+        """tool/<kind>/<event> -> audit trail cho Tool port panel (AD-6). Input is the
+        raw ToolEvent envelope (tool / payload carry the ids + reused flag)."""
+        parts = topic.split("/")
+        kind = parts[1] if len(parts) > 2 else (parts[-1] if parts else "")
+        evt = parts[-1]
+        p = env.get("payload") if isinstance(env.get("payload"), dict) else {}
+        rec = self._tools.setdefault(env.get("tool") or kind,
+                                     {"kind": kind, "events": [], "last": "", "id": ""})
+        rec["events"].append({"event": evt, "id": p.get("id", ""),
+                               "reused": bool(p.get("reused")),
+                               "reason": p.get("reason", ""), "ts": env.get("ts", "")})
+        del rec["events"][:-64]
+        rec["last"] = evt
+        rec["id"] = p.get("id") or rec["id"]
+        self._counters["tool"] = self._counters.get("tool", 0) + 1
+        if evt == "failed":
+            self._markers.append({"ts_ms": iso_ms(env.get("ts")), "kind": "tool_failed",
+                                  "label": kind, "incident_id": p.get("task_id")})
+        self._prune(self._tools, cap=100)
+
+    def _ingest_bridge(self, topic: str, env: dict) -> None:
+        """bridge/heartbeat (sole publisher: TrackCBridge, AD-5 mở rộng cho source
+        health) -> chip trạng thái kết nối cho control room."""
+        self._bridge["connected"] = bool(env.get("connected"))
+        self._bridge["since"] = env.get("ts", "")
+        self._bridge["last_seen"] = time.time()
 
     def _ingest_tele(self, topic: str, inner: dict) -> None:
         self._counters["tele"] += 1
@@ -176,8 +279,14 @@ class Dashboard:
             s["unit"] = inner["unit"]
         pts = s["points"]
         pts.append({"ts_ms": iso_ms(inner.get("ts") or inner.get("ts_ms")),
-                    "value": inner.get("value"), "phase": inner.get("phase", "")})
+                    "value": inner.get("value"), "phase": inner.get("phase", ""),
+                    "quality": inner.get("quality", "ok")})
         del pts[:-self.series_points]
+        # clock bookmarks for the two epoch-clock chips (AD-10 / AD-9)
+        self._last_tele_at = time.time()
+        ts_ms = pts[-1]["ts_ms"] if pts else None
+        if ts_ms:
+            self._last_tele_ts_ms = max(self._last_tele_ts_ms or 0, ts_ms)
 
     def _ingest_op(self, topic: str, payload: dict, inner: dict) -> None:
         self._counters["ops"] += 1
@@ -255,6 +364,13 @@ class Dashboard:
         elif leaf == "demo":
             self._variant = str(inner.get("variant") or "")
             self._counters["rounds"] = int(inner.get("round") or 0)
+        elif leaf == "incident_feed":
+            self._incfeed.append(dict(inner))
+            del self._incfeed[:-100]
+            self._markers.append({"ts_ms": iso_ms(inner.get("ts")),
+                                  "kind": "auto_incident",
+                                  "label": str(inner.get("device") or "?"),
+                                  "incident_id": inner.get("incident_id")})
 
     @staticmethod
     def _prune(od, cap: int = 100) -> None:
@@ -279,6 +395,13 @@ class Dashboard:
             counters = dict(self._counters)
             variant = self._variant
             tasks = dict(self._tasks)
+            tools = dict(self._tools)
+            bridge = dict(self._bridge)
+            incfeed = list(self._incfeed)
+            policy = dict(self._policy)
+            thresholds = dict(self._thresholds)
+            last_tele_at = self._last_tele_at
+            last_tele_ts_ms = self._last_tele_ts_ms
 
         # legacy per-incident fidelity (unchanged behaviour + alias merge)
         incidents: dict[str, dict] = {}
@@ -323,6 +446,43 @@ class Dashboard:
                         lat[f"{prev_stage}->{st}"] = max(0, ts - prev)
                     prev, prev_stage = ts, st
             d["latency_ms"] = lat
+        # device grid (AD-10): group by signal prefix, age against ref_ts = the LARGEST
+        # event-time across every signal (reg ich semantics), never wall clock.
+        ref = max((p["ts_ms"] for s in series.values() for p in s["points"]
+                   if p["ts_ms"]), default=None)
+        devices: dict[str, dict] = {}
+        for sig, s in series.items():
+            dev_id = sig.rsplit("_", 1)[0]
+            last = s["points"][-1] if s["points"] else {}
+            ts_ms = last.get("ts_ms")
+            age_s = round((ref - ts_ms) / 1000.0, 1) if (ref is not None and ts_ms) else None
+            q = last.get("quality", "ok")
+            if q in ("offline", "error", "missing_ts"):
+                worst = q
+            elif age_s is not None and age_s >= thresholds["critical_seconds"]:
+                worst = "stale-critical"
+            elif age_s is not None and age_s >= thresholds["stale_seconds"]:
+                worst = "stale"
+            else:
+                worst = "ok"
+            d = devices.setdefault(dev_id, {"device": dev_id, "signals": [],
+                                            "worst": "ok", "age_s": None,
+                                            "value": None, "unit": ""})
+            d["signals"].append({"signal": sig, "value": last.get("value"),
+                                 "unit": s.get("unit", ""), "quality": q,
+                                 "age_s": age_s})
+            order = {"ok": 0, "stale": 1, "stale-critical": 2,
+                     "error": 3, "offline": 4, "missing_ts": 3}
+            if order.get(worst, 0) > order.get(d["worst"], 0):
+                d.update(worst=worst, age_s=age_s, value=last.get("value"),
+                         unit=s.get("unit", ""))
+        # 2 on the epoch clocks (AD-10): broker epoch lag vs wall clock — proves event-time
+        clocks = {
+            "tele_ts_ms": last_tele_ts_ms,
+            "epoch_lag_s": round((time.time() - last_tele_ts_ms / 1000.0), 1)
+                           if last_tele_ts_ms else None,
+            "tele_idle_s": round(time.time() - last_tele_at, 1),
+        }
         return {
             "elapsed_s": round(time.time() - self.start_ts, 2),
             "stage_counts": stages,
@@ -341,6 +501,13 @@ class Dashboard:
             "learn": learn,
             "counters": counters,
             "tasks": tasks,
+            "tools": tools,
+            "bridge": bridge,
+            "auto_incidents": incfeed,
+            "policy": policy,
+            "thresholds": thresholds,
+            "devices": list(devices.values()),
+            "clocks": clocks,
         }
 
 

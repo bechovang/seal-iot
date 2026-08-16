@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -251,6 +252,8 @@ class TrackCBridge:
             client.tls_set()
         client.connect(host, int(self.settings.get("port", 1883)), keepalive=30)
         client.loop_start()
+        client.on_connect = self._on_connect
+        client.on_disconnect = self._on_disconnect
         self._client = client
         self.connected = True
         return True
@@ -263,12 +266,28 @@ class TrackCBridge:
         self._bus = bus
         if self.connected:
             self._client.on_message = self._on_message
-            self._client.on_connect = self._on_connect
             self._client.subscribe(f"{self.settings['topic_prefix']}+/telemetry")
 
     def _on_connect(self, client, userdata, flags, rc, properties=None) -> None:
         # paho drops subscriptions across reconnects — re-arm on every (re)connect.
         client.subscribe(f"{self.settings['topic_prefix']}+/telemetry")
+        self.connected = True
+        self._emit_heartbeat(True)
+
+    def _on_disconnect(self, client, userdata, flags, rc, properties=None) -> None:
+        self.connected = False
+        self._emit_heartbeat(False)
+
+    def _emit_heartbeat(self, connected: bool) -> None:
+        """bridge/heartbeat — sole publisher: the bridge (AD-5 source health chip)."""
+        if self._bus is None:
+            return
+        try:
+            self._bus.publish("bridge/heartbeat",
+                              {"connected": connected, "ts": _iso_utc(time.time())},
+                              qos=1)
+        except Exception:  # noqa: BLE001 — heartbeat không được giết callback paho
+            pass
 
     def _on_message(self, client, userdata, msg) -> None:
         """paho callback: one broker frame -> canonical envelopes on the internal

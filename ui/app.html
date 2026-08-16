@@ -134,12 +134,18 @@
 </head>
 <body>
 <div class="wrap">
+  <div id="banner" style="display:none;background:#5b1111;color:#ffc9c9;padding:8px 12px;border-radius:8px;margin-bottom:10px;border:1px solid var(--red);">
+    ⚠ <b>MQTT broker DISCONNECTED</b> — dữ liệu đã đóng băng (no reset, giữ cuối cùng); view-only vẫn mở.
+  </div>
   <header>
     <div class="brand">SEAL <span>Smart Ops</span></div>
     <div class="live" id="live"><span class="pulse"></span> online</div>
     <span class="chip" id="variantChip">variant: –</span>
     <span class="chip" id="redChip">red-team off</span>
     <span class="chip" id="elChip">elapsed 0s</span>
+    <span class="chip" id="bridgeChip">MQTT –</span>
+    <span class="chip" id="lagChip">broker epoch –</span>
+    <span class="chip" id="policyChip">approval policy: –</span>
     <div class="tiles" id="tiles"></div>
   </header>
 
@@ -182,8 +188,17 @@
     </div>
   </div>
 
-  <h2>Track C · coordination tasks</h2>
+  <h2>Auto incidents · detector → task (AD-1)</h2>
+  <div class="panel" id="feed"></div>
+
+  <h2>Track C · coordination tasks (FSM · approval · replan)</h2>
   <div class="panel" id="tdtasks"></div>
+
+  <h2>Devices · quality + staleness (AD-10)</h2>
+  <div class="panel"><div class="grid3" id="devices"></div></div>
+
+  <h2>Tool port audit · validate → create → read-back (AD-6)</h2>
+  <div class="panel" id="tools"></div>
 
   <h2>Event trail</h2>
   <div class="panel" id="trail"></div>
@@ -219,6 +234,20 @@ function renderHeader(s){
   rc.className="chip"+(rt?" red":"");
   document.getElementById("elChip").textContent="elapsed "+s.elapsed_s+"s";
   var c=s.counters||{};
+  // Track C chips (FE-1/6): bridge health + policy + broker epoch lag
+  var br=s.bridge||{}, ck=s.clocks||{}, pol=s.policy||{};
+  var bh=document.getElementById("bridgeChip");
+  var live=br.connected && (ck.tele_idle_s==null||ck.tele_idle_s<10);
+  var silent=br.connected && ck.tele_idle_s!=null && ck.tele_idle_s>=10;
+  bh.textContent= live?("MQTT ● LIVE · "+(c.tele||0)+" tele")
+    :(silent?"MQTT ● SILENT "+ck.tele_idle_s+"s":"MQTT ✕ DISCONNECTED");
+  bh.className="chip"+(live?"":" red");
+  document.getElementById("policyChip").textContent="approval policy: "+esc(pol.mode||"human")+
+    (pol.mode==="auto"?" · auto sau "+esc(pol.delay_s)+"s":" · chờ người duyệt");
+  document.getElementById("lagChip").textContent="broker epoch "+
+    (ck.epoch_lag_s!=null?("−"+Math.round(ck.epoch_lag_s)+"s vs wall"):"–");
+  // broker death banner
+  document.getElementById("banner").style.display=(br.connected===false)?"block":"none";
   var tiles="";
   [["tele",c.tele],["cmd",c.cmd],["ops",c.ops],["blocked",c.shield_blocked],
    ["runbook",c.runbook_hits],["rounds",c.rounds]].forEach(function(t){
@@ -445,18 +474,100 @@ function renderLearn(s){
 }
 var TASKSTAGE={observe:"Observe",plan:"Plan",analyze:"Analyze",adjudicate:"Adjudicate",
                act:"Act",verify:"Verify",report:"Report"};
+var FSM=["RECEIVED","PLANNING","COORDINATING","AWAITING_APPROVAL","EXECUTING","VERIFYING","REPORTED"];
+var TERM={"PARTIAL":"b-red","FAILED":"b-red","CANCELLED":"b-pink"};
 function renderTasks(s){
   var el=document.getElementById("tdtasks");
+  var thr=(s.thresholds||{}).approve_ttl_seconds||300, pol=s.policy||{};
   var tasks=(s.tasks?Object.keys(s.tasks).map(function(k){return s.tasks[k];}):[]).reverse();
   if(!tasks.length){el.innerHTML="<div class='empty'>no coordination tasks yet</div>";return;}
   el.innerHTML=tasks.map(function(t){
-    var last=t.events[t.events.length-1]||"";
-    var badge=last==="closed"?"b-green":(last==="approval_requested"?"b-gold":"b-pink");
-    var stages=(t.stage?["<span class='chip' style='border-color:var(--blue)'>"+esc(TASKSTAGE[t.stage]||t.stage)+"</span>"]:[]).join("");
-    var evs=(t.events||[]).slice(-8).map(function(e){return "<span class='tchip' style='background:#2b3a55'>"+esc(e)+"</span>";}).join(" ");
-    return "<div class='card'><div class='card-h'><span class='iid'>"+esc(t.task_id)+"</span>"+
-      "<span class='badge "+badge+"'>"+esc(last)+"</span><span class='muted'>"+esc(t.ts||"")+"</span></div>"+
-      "<div>"+stages+"</div><div style='margin-top:6px'>"+evs+"</div></div>";
+    var state=t.state||"RECEIVED";
+    var term=TERM[state];
+    var fsmHtml=FSM.map(function(st,i){
+      var on=state===st, done=FSM.indexOf(state)>i;
+      return "<span class='fnode "+(on?"on":(done?"done":""))+"'>"+st.slice(0,4)+"</span>";
+    }).join("<span class='flink'>→</span>")+(term?"<span class='fnode term'>"+state+"</span>":"");
+    // stage chips theo agent (AD-4) + latency event-time
+    var so=t.stage_outputs||[]; var chips=""; var prev=null;
+    so.forEach(function(o){
+      var d=prev?((Date.parse(o.ts)-prev)/1000):0; prev=Date.parse(o.ts);
+      chips+="<span class='chip' style='border-color:var(--blue)'>"+esc(o.stage)+"·"+esc(o.agent)+
+        (d>0?("<span class='num'> +"+d.toFixed(1)+"s</span>"):"")+"</span> ";
+    });
+    // approval gate READ-ONLY (FE-2)
+    var gate="";
+    if(state==="AWAITING_APPROVAL"&&t.approval){
+      var apr=t.approval; var left=(Date.parse(apr.ts)/1000+thr)-(Date.now()/1000);
+      gate="<div class='card' style='border-color:var(--gold);margin-top:8px'>"+
+        "⚠ CỔNG PHÊ DUYỆT · "+esc(apr.stage)+" · "+esc(apr.device)+"<br>"+
+        "<span class='muted'>options: "+(apr.options||[]).join(" | ")+" · TTL còn "+
+        "<b class='num'>"+Math.max(0,Math.round(left))+"s</b> (AD-8)</span><br>"+
+        "<span class='muted'>policy "+esc(pol.mode||"human")+(pol.mode==="auto"?
+          " — autopilot sẽ phát approval/"+esc(apr.approval_id)+" sau "+esc(pol.delay_s)+"s":
+          " — chờ người duyệt (production)")+"</span></div>";
+    }
+    var rp=(t.replans>0)?("<span class='badge b-gold' style='background:#2b270d;color:var(--gold)'>↺ "+
+      esc(t.replan_stage)+"→"+esc(t.replan_target)+" "+(t.replan_attempts||t.replans)+" lần</span>"):"";
+    var fr=(t.fail_reason?"<div class='muted' style='color:var(--red)'>✗ "+esc(t.fail_reason)+"</div>":"");
+    var body="";
+    if(t.finding)body+="<div class='muted'>finding: "+esc(t.finding)+"</div>";
+    if(t.report)body+="<div class='muted'>report: "+esc(t.report)+"</div>";
+    var trail=(t.events||[]).slice(-12).map(function(e){return "<span class='tchip' style='background:#2b3a55'>"+esc(e)+"</span>";}).join(" ");
+    return "<div class='card'><div class='card-h'><span class='iid'>"+esc(t.task_id)+
+      "</span>"+(term?("<span class='badge "+term+"'>"+state+"</span>"):"<span class='badge b-pink'>"+esc(state)+"</span>")+rp+
+      "<span class='muted'>"+esc(t.ts||"")+"</span></div>"+
+      "<div class='fsm' style='margin:6px 0'>"+fsmHtml+"</div>"+
+      "<div style='margin:6px 0'>"+chips+"</div>"+gate+fr+body+
+      "<div style='margin-top:6px'>"+trail+"</div></div>";
+  }).join("");
+}
+function renderFeed(s){
+  var el=document.getElementById("feed");
+  var f=(s.auto_incidents||[]).slice().reverse();
+  if(!f.length){el.innerHTML="<div class='empty'>chưa có sự cố tự phát hiện — stream đang lành</div>";return;}
+  el.innerHTML=f.slice(0,20).map(function(e){
+    var sev=e.severity==="high"||e.severity==="critical"?"b-red":"b-gold";
+    return "<div class='card'><div class='card-h'><span class='iid'>"+esc(e.incident_id)+
+      "</span><span class='badge "+sev+"'>"+esc(e.severity)+" → "+esc(e.priority)+"</span>"+
+      "<span class='muted'>"+esc(e.ts||"")+"</span></div>"+
+      "<div class='muted'>"+esc(e.reason)+" · task "+esc(e.task_id)+
+      " · "+(e.minted?"auto-spawned (mới)":"đã có task — chỉ nâng priority (idempotent)")+"</div></div>";
+  }).join("");
+}
+function renderDevices(s){
+  var el=document.getElementById("devices");
+  var ds=(s.devices||[]); var thr=s.thresholds||{};
+  if(!ds.length){el.innerHTML="<div class='empty'>chưa có telemetry</div>";return;}
+  el.innerHTML=ds.map(function(d){
+    var col=d.worst==="ok"?"var(--green)":(d.worst==="stale"?"var(--amber)":"var(--red)");
+    var age=d.age_s!=null?d.age_s:0;
+    var w=Math.min(100,(age/((thr.critical_seconds||120)*1.0))*100);
+    var sigs=(d.signals||[]).map(function(g){
+      return "<span class='chip'>"+esc(g.signal.split("_").pop())+" "+fmt(g.value)+
+        " <b style='color:"+(g.quality==="ok"?"var(--green)":"var(--red)")+"'>●</b></span>";
+    }).join(" ");
+    return "<div class='card' style='border-color:"+(d.worst==="ok"?"var(--line)":col)+"'>"+
+      "<div class='card-h'><span class='iid'>"+esc(d.device)+"</span>"+
+      "<span class='badge' style='background:"+col+";color:#0b101b'>"+esc(d.worst)+"</span>"+
+      "<span class='muted'>age "+esc(d.age_s)+"s (event-time)</span></div>"+
+      "<div class='barwrap' style='width:100%'><i class='bar' style='width:"+w+"%;background:"+col+"'></i></div>"+
+      "<div style='margin-top:6px'>"+sigs+"</div></div>";
+  }).join("");
+}
+function renderTools(s){
+  var el=document.getElementById("tools");
+  var ts=(s.tools?Object.keys(s.tools).map(function(k){return s.tools[k];}):[]);
+  if(!ts.length){el.innerHTML="<div class='empty'>chưa có artifact nào qua Tool port</div>";return;}
+  el.innerHTML=ts.map(function(t){
+    var ev=(t.events||[]).slice(-6).map(function(e){
+      var bad=e.event==="failed";
+      return "<span class='chip' style='"+(bad?"border-color:var(--red);color:var(--red)":"")+"'>"+
+        esc(e.event)+(e.reused?" ⟲ reused":"")+(bad?(" — "+esc(e.reason)):"")+"</span>";
+    }).join(" ");
+    return "<div class='card'><div class='card-h'><span class='iid'>"+esc(t.kind)+"</span>"+
+      "<span class='badge "+(t.last==="failed"?"b-red":"b-green")+"'>"+esc(t.last)+"</span>"+
+      "<span class='muted'>id "+esc(t.id)+"</span></div><div>"+ev+"</div></div>";
   }).join("");
 }
 function renderTrail(s){
@@ -474,17 +585,13 @@ function renderTrail(s){
   }).join("");
 }
 function renderFooter(){
-  var arch=["HAI CSV","INGEST","PERCEIVE","DIAGNOSE","DECIDE","SHIELD","EXECUTOR"],
-     arrows=["→","→","→","→","→","→"];
-  var arcHtml="";
-  arch.forEach(function(a,i){
-    arcHtml+="<span class='a'>"+a+"</span>"+(i<arch.length-1?"<span class='ar'>"+(a==="EXECUTOR"?" (sole publisher) →":"→")+"</span>":"");
-  });
-  arcHtml+="<span class='ar'>→</span><span class='a'>VERIFY</span><span class='ar'>→</span><span class='a'>FSM</span><span class='ar'>→</span><span class='a' style='color:var(--gold)'>LEARN</span>";
-  document.getElementById("arch").innerHTML=arcHtml;
-  var ads=["AD-1 shield never off","AD-2 incident FSM","AD-3 runbook distill","AD-5 debate gate",
-    "AD-6 objective DECIDE","AD-7 sole publisher","AD-8 guarded action","AD-9 verify resolve",
-    "AD-10 event-time","AD-11 single metric writer","AD-13 degraded modes","AD-14 demo/replay"];
+  var arch=["MQTT wss","tele/*","history","detector","supervisor task/*","tool port tool/*","dashboard view-only"];
+  document.getElementById("arch").innerHTML=arch.map(function(a,i){
+    return "<span class='a'>"+a+"</span>"+(i<arch.length-1?"<span class='ar'>→</span>":"");
+  }).join("")+"<span class='ar'>·</span><span class='a' style='color:var(--gold)'>approval policy → approval/&lt;id&gt; (autopilot route)</span>";
+  var ads=["AD-1 single-queue supervisor","AD-2 task FSM","AD-3 deterministic playbooks","AD-4 agents=LLM contexts",
+    "AD-5 sole publishers","AD-6 tool port read-back","AD-8 approval TTL","AD-9 broker quarantined",
+    "AD-10 event-time freshness","AD-11 registry identity","AD-12 no cmd from task layer","AD-13 replay=render"];
   document.getElementById("adr").innerHTML=ads.map(function(a){return "<span class='adb'>"+a+"</span>";}).join("");
 }
 
@@ -492,9 +599,7 @@ function renderFooter(){
 var lastSections={};
 function tick(){
   fetch("?json=1").then(function(r){return r.json();}).then(function(s){
-    var secs={header:s,pipeline:s,chart:s,incidents:s,diagnose:s,decide:s,
-              shield:s,verify:s,learn:s,trail:s,tasks:s};
-    if(lastSections.header!==JSON.stringify([s.variant,s.counters,s.elapsed_s]))renderHeader(s);
+    if(lastSections.header!==JSON.stringify([s.variant,s.counters,s.elapsed_s,s.bridge,s.clocks,s.policy]))renderHeader(s);
     if(lastSections.pipeline!==JSON.stringify(s.pipeline_counts||{}))renderPipeline(s);
     if(lastSections.chart!==JSON.stringify(s.signals||{}))renderChart(s);
     if(lastSections.incidents!==JSON.stringify([s.incidents,s.fsm,s.decisions]))renderIncidents(s);
@@ -505,8 +610,11 @@ function tick(){
     if(lastSections.learn!==JSON.stringify(s.learn||{}))renderLearn(s);
     if(lastSections.trail!==JSON.stringify(s.recent||{}))renderTrail(s);
     if(lastSections.tasks!==JSON.stringify(s.tasks||{}))renderTasks(s);
+    if(lastSections.feed!==JSON.stringify(s.auto_incidents||[]))renderFeed(s);
+    if(lastSections.devices!==JSON.stringify([s.devices,s.thresholds]))renderDevices(s);
+    if(lastSections.tools!==JSON.stringify(s.tools||{}))renderTools(s);
     lastSections.tasks=JSON.stringify(s.tasks||{});
-    lastSections.header=JSON.stringify([s.variant,s.counters,s.elapsed_s]);
+    lastSections.header=JSON.stringify([s.variant,s.counters,s.elapsed_s,s.bridge,s.clocks,s.policy]);
     lastSections.pipeline=JSON.stringify(s.pipeline_counts||{});
     lastSections.chart=JSON.stringify(s.signals||{});
     lastSections.incidents=JSON.stringify([s.incidents,s.fsm,s.decisions]);
@@ -516,6 +624,9 @@ function tick(){
     lastSections.verify=JSON.stringify(s.verifies||{});
     lastSections.learn=JSON.stringify(s.learn||{});
     lastSections.trail=JSON.stringify(s.recent||{});
+    lastSections.feed=JSON.stringify(s.auto_incidents||[]);
+    lastSections.devices=JSON.stringify([s.devices,s.thresholds]);
+    lastSections.tools=JSON.stringify(s.tools||{});
   }).catch(function(){/* UI stays: dashboard down doesn't break anything */});
 }
 renderFooter();

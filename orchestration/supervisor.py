@@ -359,7 +359,8 @@ class Supervisor:
         self.store.set_approval(task_id, apr.backend_id)
         self._task_event(task_id, "approval_requested",
                          {"approval_id": apr.backend_id, "options": options,
-                          "device": device, "stage": stage.name, "evidence": evidence})
+                          "device": device, "stage": stage.name, "evidence": evidence,
+                          "state": "AWAITING_APPROVAL"})
         return {"state": "AWAITING_APPROVAL", "task_id": task_id}
 
     def handle_approval(self, task_id: str, payload: dict) -> dict:

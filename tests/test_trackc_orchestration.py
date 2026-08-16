@@ -441,3 +441,108 @@ def test_p2_port_list_by_key_returns_recorded_artifact():
     assert len(lst) == 1
     assert lst[0]["kind"] == "work_order"
     assert lst[0]["backend_id"] == r.backend_id
+
+
+# ── Auto-loop (AD-1/AD-10): detector + approval autopilot ────────────────────
+def test_auto_loop_detector_spawns_idempotent():
+    """Detector: stopped-stream/quality -> spawn from incident, idempotent trong cùng
+    cửa sổ (re-scan chỉ raise priority), severity high -> priority URGENT (bảng đóng),
+    có frame ops/incident_feed."""
+    import time
+    from orchestration.auto_loop import AutoLoopDetector
+
+    reg, bus, store, _, _, hist, sup = build_fabric(seed_ticks=0)
+    hist.write("motor_01_vibration", int(time.time() * 1000), 1.0, quality="offline")
+    d = AutoLoopDetector(sup, reg, hist, bus=bus)
+    r1 = d.scan()
+    dev = [e for e in r1 if e["device"] == "motor_01"]
+    assert dev and dev[0]["severity"] == "high" and dev[0]["priority"] == "URGENT"
+    assert dev[0]["minted"] is True
+    task_id = dev[0]["task_id"]
+    # cùng cửa sổ -> idempotent, không mint task thứ hai
+    r2 = d.scan()
+    dev2 = [e for e in r2 if e["device"] == "motor_01"]
+    assert dev2 and dev2[0]["minted"] is False
+    assert dev2[0]["task_id"] == task_id
+    live = store.list_by()
+    assert len(live) == 1
+    feed = [p for t, p in bus.messages if t == "ops/incident_feed"]
+    assert len(feed) == 2
+    assert feed[0]["incident_id"] == feed[1]["incident_id"]
+
+
+def test_auto_loop_detector_new_window_mints_new_task():
+    """Cửa sổ mới (window_s nhỏ, sleep qua) -> mint task mới: không trùng lặp vĩnh viễn."""
+    import time
+    from orchestration.auto_loop import AutoLoopDetector
+
+    reg, bus, store, _, _, hist, sup = build_fabric(seed_ticks=0)
+    hist.write("line_01_voltage", int(time.time() * 1000), 5.0, quality="error")
+    d = AutoLoopDetector(sup, reg, hist, bus=bus, window_s=0.2)
+    d.scan()
+    first = [p for t, p in bus.messages if t == "ops/incident_feed"][0]["incident_id"]
+    time.sleep(0.25)   # qua cửa sổ
+    d.scan()
+    feed = [p for t, p in bus.messages if t == "ops/incident_feed"]
+    assert len(feed) >= 2
+    assert feed[-1]["incident_id"] != first
+    assert feed[-1]["minted"] is True
+
+
+def test_autopilot_approves_via_sole_publisher():
+    """Autopilot phát quyết định QUA dashboard (sole publisher) — bus phải có frame
+    approval/<task_id>, không phải gọi thẳng supervisor."""
+    import time as _t
+    from orchestration.auto_loop import ApprovalAutopilot
+    from tests.test_trackc_dashboard import make_dash
+
+    _, bus, store, cmms, _, _, sup, dash = make_dash()
+    dash.publish_request("prepare inspection", "prepare_inspection", "URGENT")
+    tid = store.list_by()[0].task_id
+    autop = ApprovalAutopilot(dash, policy="auto", delay=0.0, interval=0.01)
+    deadline = _t.time() + 8.0
+    while _t.time() < deadline and store.get(tid).state != "REPORTED":
+        autop.poll()
+        _t.sleep(0.05)
+    assert store.get(tid).state == "REPORTED"
+    apropos = [t for t, _ in bus.messages if t.startswith("approval/")]
+    assert apropos, "autopilot phải đi qua approval/<id> (sole publisher, AD-5)"
+    assert len(cmms.lookup("work_orders")) >= 1
+
+
+def test_autopilot_policy_human_waits():
+    """Policy human: autopilot không đụng vào — task dừng ở AWAITING_APPROVAL."""
+    import time as _t
+    from orchestration.auto_loop import ApprovalAutopilot
+    from tests.test_trackc_dashboard import make_dash, _poll_state
+
+    _, _, store, _, _, _, sup, dash = make_dash()
+    dash.publish_request("prepare inspection", "prepare_inspection", "URGENT")
+    tid = store.list_by()[0].task_id
+    _poll_state(store, tid, "AWAITING_APPROVAL")
+    autop = ApprovalAutopilot(dash, policy="human", delay=0.0)
+    for _ in range(5):
+        autop.poll()
+    assert store.get(tid).state == "AWAITING_APPROVAL"
+    assert autop.decisions == []
+
+
+def test_autopilot_deny_first_partials():
+    """Policy deny-first: từ chối approval đầu -> PARTIAL + fail_reason approval_denied,
+    bus có frame DENIED."""
+    import time as _t
+    from orchestration.auto_loop import ApprovalAutopilot
+    from tests.test_trackc_dashboard import make_dash, _poll_state
+
+    _, bus, store, _, _, _, sup, dash = make_dash()
+    dash.publish_request("prepare inspection", "prepare_inspection", "URGENT")
+    tid = store.list_by()[0].task_id
+    _poll_state(store, tid, "AWAITING_APPROVAL")
+    autop = ApprovalAutopilot(dash, policy="deny-first", delay=0.0)
+    deadline = _t.time() + 6.0
+    while _t.time() < deadline and store.get(tid).state != "PARTIAL":
+        autop.poll()
+        _t.sleep(0.05)
+    assert store.get(tid).state == "PARTIAL"
+    denied = [p for t, p in bus.messages if t.startswith("approval/") and p.get("decision") == "DENIED"]
+    assert denied

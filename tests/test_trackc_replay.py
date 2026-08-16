@@ -9,7 +9,7 @@ from orchestration.replay import render_trail, summarize_trail, run_degrated_dri
 def test_replay_is_render_not_execution():
     """Passing a recorded trail to the renderer must produce NO side effects — no
     task minted, no artifact created, no stage executed. Pure function."""
-    from test_trackc_orchestration import build_fabric
+    from tests.test_trackc_orchestration import build_fabric
 
     reg, bus, store, cmms, port, hist, sup = build_fabric()
     res = sup.ingest_request("prepare inspection", "prepare_inspection")
@@ -36,7 +36,7 @@ def test_render_does_not_respawn_task():
     """AD-13: sending the recorded trail back into the supervisor's ingest path must
     be a no-op OR the renderer itself never touches the bus at all. We assert the
     renderer publishes nothing and mints nothing."""
-    from test_trackc_orchestration import build_fabric
+    from tests.test_trackc_orchestration import build_fabric
 
     reg, bus, store, cmms, port, hist, sup = build_fabric()
     res = sup.ingest_request("conflict assessment", "conflict_assessment")
@@ -49,7 +49,7 @@ def test_render_does_not_respawn_task():
 
 
 def test_summary_trail_counts_are_read_only():
-    from test_trackc_orchestration import build_fabric
+    from tests.test_trackc_orchestration import build_fabric
 
     reg, bus, store, cmms, port, hist, sup = build_fabric()
     res = sup.ingest_request("prepare inspection", "prepare_inspection")

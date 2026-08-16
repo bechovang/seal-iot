@@ -6,10 +6,12 @@ from .playbooks import (Playbook, PlaybookStage, BackEdge, PLAYBOOKS, PREPARE_IN
                         CONFLICT_ASSESSMENT, LINE_INSPECTION_TIMEOUT, GENERIC,
                         get_playbook, SEVERITY_PRIORITY)
 from .supervisor import Supervisor
+from .auto_loop import AutoLoopDetector, ApprovalAutopilot
 
 __all__ = [
     "Task", "TaskStore", "TaskFSM", "TERMINAL", "STATES", "TRANSITIONS", "PRIORITIES",
     "Playbook", "PlaybookStage", "BackEdge", "PLAYBOOKS", "PREPARE_INSPECTION",
     "CONFLICT_ASSESSMENT", "LINE_INSPECTION_TIMEOUT", "GENERIC", "get_playbook",
     "SEVERITY_PRIORITY", "Supervisor",
+    "AutoLoopDetector", "ApprovalAutopilot",
 ]
