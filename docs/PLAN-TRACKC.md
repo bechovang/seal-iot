@@ -16,7 +16,7 @@
 
 ## Epic 0 — Ingress (không cần broker host)
 
-**Mục tiêu:** registry chuẩn + parser + simulator phát telemetry 6/6 thiết bị lên `tele/*`.
+**Mục tiêu:** registry chuẩn + parser/publisher theo contract BTC + simulator phát telemetry 6/6 thiết bị (payload contract → broker → subscribe lại → `tele/*` loopback).
 
 ### 0.1 `mapping.yaml` — thêm section `trackc:` (cuối file)
 
@@ -72,18 +72,36 @@ Nạp trong `load_mapping()`: `m.trackc = TrackCRegistry(...) if "trackc" in cfg
 
 ### 0.3 `adapters/trackc.py`
 
-- `parse_payload(raw: dict, registry) -> ParseResult(envelopes, skipped, missing_ts)`:
-  - **Shape A** (1 device): `{"device": "MOTOR_01", "ts": "...", "metrics": {"current": 12.3}}` — chấp nhận alias `values`/`data` cho metrics, `time`/`timestamp` cho ts.
-  - **Shape B** (nhiều device): `{"ts": "...", "MOTOR_01": {"current": 12.3}}`.
-  - Device/metric **case-insensitive** → chuẩn hóa lowercase theo registry.
-  - ts numeric (epoch s/ms) → ISO-8601 UTC; string → passthrough; **thiếu ts → `ts=""`, `quality="missing_ts"`** (không bao giờ dùng wall clock — AD-9/10).
-  - Device/metric lạ → bỏ vào `skipped` (có lý do), không crash.
-- `TrackCSource(registry, host, port, username, password, topic, tls)` — **nơi duy nhất** gọi `username_pw_set()`/`tls_set()` (paho trực tiếp, `PahoTransport` giữ nguyên). `start(bus)` subscribe topic (mặc định `<topic_prefix>test/telemetry`, lấy từ `mqtt.env`), `on_message` → `parse_payload` → `bus.publish_telemetry(...)`.
-- `settings_from_env(path)` đọc `mqtt.env` (parser KEY=VALUE tối giản ~10 dòng).
+> **Contract BTC đã có (spec thầy gửi 2026-08-16)** — hết đoán shape. Payload **cố định từng field/kiểu**, chỉ *giá trị* được đổi; và hướng dữ liệu là **ta publish → hệ thống chấm subscribe** (topic `judge`), đồng thời ta subscribe lại chính topic đó cho pipeline mình (loopback).
 
-### 0.4 `adapters/trackc_sim.py` — nguồn tạm khi chưa có broker
+**Shape contract (bất biến):**
 
-`TrackCSim(registry, seed=21)`, `tick(seq) -> list[TelemetryEnvelope]`: giá trị = `base + amp*sin(2π·seq/period + phase) + noise(seeded)`; **ts = BASE_TS + seq giây** (event-time, AD-10 — không dùng wall clock). Profiles:
+```json
+{
+  "timestamp": "2026-07-18T07:30:01.000Z",
+  "epoch": 1784369401,
+  "environment": "FACTORY",
+  "teamCode": "UNDERRATED",
+  "devices": [
+    {"deviceCode": "MOTOR_01", "status": "ok",
+     "metrics": {"current": 12.3, "vibration": 2.5, "temperature": 55.0}}
+  ]
+}
+```
+
+- `parse_payload(raw: dict, registry) -> ParseResult(envelopes, skipped, meta)`:
+  - `devices` là **mảng** — 1 message nhiều thiết bị; `deviceCode` UPPERCASE → chuẩn hóa lowercase theo registry; metric key đã lowercase.
+  - `status` (`ok|error|offline`) → thẳng vào `quality` của envelope. `offline`/`error` = tín hiệu Kịch bản 3 (observer tính staleness từ đây + age).
+  - ts: **ưu tiên `epoch`** (int giây → ISO-8601 UTC; không mơ hồ TZ) → fallback `timestamp` string; thiếu cả hai → `ts=""`, `quality="missing_ts"` (không bao giờ dùng wall clock — AD-9/10). ⚠️ Sample BTC tự mâu thuẫn (timestamp 07:30:01Z ≠ epoch 10:10:01Z) — chọn 1 nguồn, không cross-validate.
+  - `environment`/`teamCode` → `meta` (UI MQTT status hiển thị); `teamCode` sai → skip cả message với lý do.
+  - Device/metric lạ → `skipped` (có lý do), không crash.
+- `build_payload(devices, environment, team_code, epoch) -> dict` — **xuất đúng contract**: đúng field, đúng kiểu, không thêm/bớt/lồng lại (ràng buộc "giữ nguyên bất biến giao thức" áp cho ta khi publish). `deviceCode = device_id.upper()`.
+- `TrackCBridge(registry, settings)` — **nơi duy nhất** gọi `username_pw_set()`/`tls_set()` (paho trực tiếp, `PahoTransport` giữ nguyên). `start(bus)`: subscribe `hackathon/underrated/+/telemetry` (nhận cả `test` lẫn `judge`); `publish_tick(...)` phát sim lên `hackathon/underrated/<env>/telemetry` với `env` = `test|judge` từ `mqtt.env` (dev dùng `test`, demo chấm dùng `judge`).
+- `settings_from_env(path)` đọc `mqtt.env` (parser KEY=VALUE tối giản ~10 dòng). Thêm biến: `MQTT_ENV=test|judge`, `TRACKC_TEAM=UNDERRATED`, `TRACKC_ENVIRONMENT=FACTORY` (chờ BTC confirm giá trị đúng cho Track C).
+
+### 0.4 `adapters/trackc_sim.py` — nguồn phát khi có broker (và nguồn chạy local)
+
+`TrackCSim(registry, seed=21)`, `tick(seq) -> dict` **trả contract payload** (qua `build_payload`): giá trị = `base + amp*sin(2π·seq/period + phase) + noise(seeded)`; **epoch = BASE_TS + seq** (event-time, AD-10 — không dùng wall clock); `status="ok"` mặc định — nhận `force_status={device_id: "offline"|"error"}` để diễn Kịch bản 3. Profiles:
 
 | signal | base | amp | unit |
 |---|---|---|---|
@@ -102,14 +120,15 @@ Nạp trong `load_mapping()`: `m.trackc = TrackCRegistry(...) if "trackc" in cfg
 
 1. `test_registry_loads_six_devices` — 6 device, 10 signal, id lowercase, unit khớp bảng đề, `validate() == []`.
 2. `test_registry_rejects_bad_id_and_unknown_relation` — registry sửa tay → có lỗi validate.
-3. `test_parse_shape_a_single_device` — envelope `motor_01_current`, unit A, ts passthrough.
-4. `test_parse_shape_b_multi_device` — 1 message → envelope cho ≥2 device.
-5. `test_parse_normalizes_uppercase` — `MOTOR_01`/`Current` → id thường.
-6. `test_parse_skips_unknown_without_crash` — device lạ vào `skipped`.
-7. `test_parse_missing_ts_marks_quality` — `quality == "missing_ts"`, ts rỗng.
-8. `test_sim_covers_all_devices_deterministic` — `tick(0..5)` đủ 6 device / 10 signal; seed giống → giá trị giống; ts tăng đúng 1s/bước.
+3. `test_parse_contract_sample` — fixture theo đúng cấu trúc sample BTC (MOTOR_01 + LINE_01 trong 1 mảng `devices`) → đủ envelope, đúng unit, ts từ `epoch` → ISO UTC.
+4. `test_parse_btc_sample_unknown_device_graceful` — nguyên văn sample AC_01 của BTC → vào `skipped`, không crash.
+5. `test_parse_status_maps_to_quality` — `status:"offline"` → `quality == "offline"` trên mọi envelope của device đó.
+6. `test_parse_epoch_preferred_over_timestamp` — epoch đúng, timestamp lệch → ts theo epoch; thiếu cả hai → `missing_ts`.
+7. `test_build_payload_exact_contract` — đúng 5 field top-level, đúng kiểu, `deviceCode` uppercase, không field thừa.
+8. `test_roundtrip_sim_parse` — `sim.tick(n)` → `build_payload` → `parse_payload` → đúng bộ envelope/giá trị/ts (loopback chứng minh đường MQTT thật).
+9. `test_sim_covers_all_devices_deterministic` — `tick(0..5)` đủ 6 device / 10 signal; seed giống → giá trị giống; epoch tăng đúng 1s/bước; `force_status` chạy được.
 
-**Khi có host:** điền `mqtt.env` → `PYTHONUTF8=1 uv run python scripts/probe_mqtt.py` → sửa `parse_payload` cho đúng shape thật (chỉ file này + test).
+**Khi có host:** điền `mqtt.env` → `PYTHONUTF8=1 uv run python scripts/probe_mqtt.py` (script subscribe `hackathon/underrated/#` nên thấy cả 2 topic test/judge nếu organizer phát).
 
 ---
 
@@ -180,5 +199,7 @@ Epic 0 → Epic 1 → (Epic 2 ∥ Epic 3) → Epic 4 → Epic 5 → Epic 6
 
 ## Chờ BTC (không chặn build)
 
-1. **Broker host** → điền `mqtt.env` → chạy probe → sửa `parse_payload` (1 file).
-2. **`tk_…` key / API thật** → thêm backend thứ hai cho `ToolPort` (không đụng agents).
+1. **Broker host — VẪN CHƯA CÓ** (spec thầy gửi mới có topic + payload). Có host → điền `mqtt.env` → chạy probe → bridge chạy thật.
+2. **`environment` cho Track C** — sample là "HOME" của track khác; đoán "FACTORY" — confirm với thầy/BTC trước lúc phát `judge`.
+3. **`timestamp` vs `epoch` mâu thuẫn trong sample** — ta đã chọn `epoch` làm nguồn sự thật; hỏi BTC confirm.
+4. **`tk_…` key / API thật** → thêm backend thứ hai cho `ToolPort` (không đụng agents).
