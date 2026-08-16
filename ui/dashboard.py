@@ -471,6 +471,11 @@ class Dashboard:
             d["signals"].append({"signal": sig, "value": last.get("value"),
                                  "unit": s.get("unit", ""), "quality": q,
                                  "age_s": age_s})
+            # luon co age/value o card (khong chi khi trang thai xau hon xuat hien)
+            if d["age_s"] is None and age_s is not None:
+                d["age_s"] = age_s
+                d["value"] = last.get("value")
+                d["unit"] = s.get("unit", "")
             order = {"ok": 0, "stale": 1, "stale-critical": 2,
                      "error": 3, "offline": 4, "missing_ts": 3}
             if order.get(worst, 0) > order.get(d["worst"], 0):
